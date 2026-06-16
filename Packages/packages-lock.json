@@ -98,7 +98,7 @@
       "url": "https://packages.unity.com"
     },
     "com.unity.ai.navigation": {
-      "version": "2.0.12",
+      "version": "2.0.13",
       "depth": 0,
       "source": "registry",
       "dependencies": {
@@ -255,7 +255,7 @@
       }
     },
     "com.unity.test-framework.performance": {
-      "version": "3.4.0",
+      "version": "3.5.0",
       "depth": 3,
       "source": "registry",
       "dependencies": {
@@ -343,6 +343,19 @@
         "com.unity.xr.core-utils": "2.2.1",
         "com.unity.modules.subsystems": "1.0.0",
         "com.unity.xr.legacyinputhelpers": "2.1.11"
+      },
+      "url": "https://packages.unity.com"
+    },
+    "com.unity.xr.openxr": {
+      "version": "1.16.1",
+      "depth": 0,
+      "source": "registry",
+      "dependencies": {
+        "com.unity.inputsystem": "1.6.3",
+        "com.unity.xr.core-utils": "2.3.0",
+        "com.unity.xr.management": "4.4.0",
+        "com.unity.modules.androidjni": "1.0.0",
+        "com.unity.xr.legacyinputhelpers": "2.1.2"
       },
       "url": "https://packages.unity.com"
     },
