@@ -20,6 +20,15 @@ namespace FireSim
         public float emissionRate = 300f;
         public float hapticFrequency = 0.6f;
         public float hapticMaxAmplitude = 0.7f;
+        [Tooltip("When false, the built-in scalar rumble is skipped so an external system (e.g. the " +
+                 "AI haptics pipeline) can drive haptics via the Spraying event instead.")]
+        public bool useBuiltInHaptics = true;
+
+        /// <summary>
+        /// Raised every frame while foam is spraying, with the current trigger value (0-1). The AI
+        /// haptics scene subscribes to this to generate spray haptics; the original scene ignores it.
+        /// </summary>
+        public event System.Action<float> Spraying;
 
         ParticleSystem _foam;
         ParticleSystem.EmissionModule _emission;
@@ -79,15 +88,20 @@ namespace FireSim
             if (wantSpray)
             {
                 _emission.rateOverTime = emissionRate;
-                // Vibration intensity tracks how hard the trigger is pulled.
-                float amplitude = Mathf.Lerp(0.15f, hapticMaxAmplitude, Mathf.InverseLerp(triggerThreshold, 1f, trigger));
-                OVRInput.SetControllerVibration(hapticFrequency, amplitude, OVRInput.Controller.RTouch);
+                if (useBuiltInHaptics)
+                {
+                    // Vibration intensity tracks how hard the trigger is pulled.
+                    float amplitude = Mathf.Lerp(0.15f, hapticMaxAmplitude, Mathf.InverseLerp(triggerThreshold, 1f, trigger));
+                    OVRInput.SetControllerVibration(hapticFrequency, amplitude, OVRInput.Controller.RTouch);
+                }
+                Spraying?.Invoke(trigger);
                 _spraying = true;
             }
             else if (_spraying)
             {
                 _emission.rateOverTime = 0f;
-                OVRInput.SetControllerVibration(0f, 0f, OVRInput.Controller.RTouch);
+                if (useBuiltInHaptics)
+                    OVRInput.SetControllerVibration(0f, 0f, OVRInput.Controller.RTouch);
                 _spraying = false;
             }
         }

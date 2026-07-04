@@ -1,0 +1,5 @@
+{
+  "_comment": "Copy this file to 'hapticai.local.json' (same folder) and fill in your values. hapticai.local.json is gitignored so your secrets never get committed. Leave a value empty to disable that feature: empty geminiApiKey -> the offline prompt stage is used; empty hapticGenUrl -> the mock haptic synth is used.",
+  "geminiApiKey": "",
+  "hapticGenUrl": ""
+}

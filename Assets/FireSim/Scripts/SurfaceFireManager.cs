@@ -50,6 +50,13 @@ namespace FireSim
 
         public int BurningCount => _spots.Count;
 
+        /// <summary>Raised for the very first fire of the scene.</summary>
+        public event System.Action<FireSpot> SpotIgnited;
+        /// <summary>Raised each time fire spreads to a new patch.</summary>
+        public event System.Action<FireSpot> SpotSpread;
+        /// <summary>Raised as a patch is extinguished. The AI haptics scene listens to these.</summary>
+        public event System.Action<FireSpot> SpotExtinguished;
+
         void Awake()
         {
             _fireRoot = new GameObject("Fire").transform;
@@ -100,7 +107,7 @@ namespace FireSim
                 _room.GenerateRandomPositionOnSurface(MRUK.SurfaceType.FACING_UP, spotRadius,
                     new LabelFilter(MRUKAnchor.SceneLabels.FLOOR), out pos, out normal))
             {
-                SpawnSpot(pos, normal, FindAnchorAt(pos));
+                SpotIgnited?.Invoke(SpawnSpot(pos, normal, FindAnchorAt(pos)));
                 return true;
             }
 
@@ -110,7 +117,7 @@ namespace FireSim
                 var anchor = _flammableAnchors[0];
                 Vector3 center = anchor.GetAnchorCenter();
                 anchor.GetClosestSurfacePosition(center, out var surfacePos, out var surfaceNormal);
-                SpawnSpot(surfacePos, surfaceNormal, anchor);
+                SpotIgnited?.Invoke(SpawnSpot(surfacePos, surfaceNormal, anchor));
                 return true;
             }
 
@@ -156,7 +163,7 @@ namespace FireSim
                 return;
             if (IsTooCloseToExistingSpot(surfacePos)) return;
 
-            SpawnSpot(surfacePos, surfaceNormal, anchor);
+            SpotSpread?.Invoke(SpawnSpot(surfacePos, surfaceNormal, anchor));
         }
 
         bool FindNearestSurfacePoint(Vector3 worldPoint, out Vector3 closest, out Vector3 normal, out MRUKAnchor anchor)
@@ -197,17 +204,19 @@ namespace FireSim
             return false;
         }
 
-        void SpawnSpot(Vector3 position, Vector3 normal, MRUKAnchor anchor)
+        FireSpot SpawnSpot(Vector3 position, Vector3 normal, MRUKAnchor anchor)
         {
             var go = new GameObject("FireSpot");
             go.transform.SetParent(_fireRoot, false);
             var spot = go.AddComponent<FireSpot>();
             spot.Initialise(this, position, normal, anchor, spotRadius, spotHealth, foamDamagePerParticle);
             _spots.Add(spot);
+            return spot;
         }
 
         public void OnSpotExtinguished(FireSpot spot)
         {
+            SpotExtinguished?.Invoke(spot);
             _spots.Remove(spot);
             if (_spots.Count == 0)
                 Debug.Log("[FireSim] All fire extinguished. Well done!");

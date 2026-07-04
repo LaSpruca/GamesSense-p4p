@@ -1,0 +1,6 @@
+# Server wrapper deps. HaptiGen/AudioCraft itself is installed separately from the
+# HapticGen repo (https://github.com/HapticGen/HapticGen) and pulls in torch/torchaudio.
+fastapi>=0.110
+uvicorn[standard]>=0.29
+pydantic>=2.0
+numpy>=1.24

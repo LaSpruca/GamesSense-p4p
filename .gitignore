@@ -105,3 +105,7 @@ InitTestScene*.unity*
 
 # Auto-generated scenes by play mode tests
 /[Aa]ssets/[Ii]nit[Tt]est[Ss]cene*.unity*
+
+# HapticAI runtime secrets (Gemini API key, HaptiGen URL) — never commit
+/[Aa]ssets/StreamingAssets/hapticai.local.json
+/[Aa]ssets/StreamingAssets/hapticai.local.json.meta
