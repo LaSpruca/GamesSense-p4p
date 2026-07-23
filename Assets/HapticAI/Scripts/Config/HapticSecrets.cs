@@ -10,13 +10,14 @@ namespace HapticAI.Config
     /// <summary>
     /// Runtime secrets kept OUT of source control. Loaded from
     /// <c>Assets/StreamingAssets/hapticai.local.json</c> (gitignored). A committed
-    /// <c>hapticai.config.template.json</c> documents the shape.
+    /// <c>hapticai.config.template.json</c> documents the shape. Since the prompting move this is
+    /// just the backend URL — the Gemini key now lives on that server, not on the headset. An empty
+    /// URL runs the scene fully on-device (offline mock synth).
     /// </summary>
     [Serializable]
     public sealed class HapticSecrets
     {
-        public string geminiApiKey = "";
-        public string hapticGenUrl = "";
+        public string hapticServiceUrl = "";
 
         public static async Task<HapticSecrets> LoadAsync(string fileName = "hapticai.local.json")
         {
@@ -30,7 +31,7 @@ namespace HapticAI.Config
             if (www.result != UnityWebRequest.Result.Success)
             {
                 Debug.LogWarning($"[HapticAI] No secrets file at {fileName} ({www.error}). " +
-                                 "Running offline: Gemini disabled, HaptiGen URL empty.");
+                                 "Running fully on-device (offline synthesis, no backend).");
                 return new HapticSecrets();
             }
 

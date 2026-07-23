@@ -1,74 +1,33 @@
-using System;
-using System.Collections.Generic;
 using UnityEngine;
 
 namespace HapticAI.Config
 {
-    public enum SynthProviderKind
-    {
-        Mock,
-        HaptiGenHttp,
-    }
-
-    /// <summary>One Gemini stage as editable data, so prompt wording is tuned without recompiling.</summary>
-    [Serializable]
-    public sealed class PromptStageTemplate
-    {
-        public string name = "stage";
-        [TextArea(2, 6)] public string systemInstruction = "";
-        [TextArea(2, 6)] public string userTemplate = "{input}";
-    }
-
     /// <summary>
-    /// Central, inspector-editable configuration for the AI haptics pipeline. Secrets (Gemini key,
-    /// HaptiGen URL) live outside this asset in a gitignored StreamingAssets file; see
-    /// <see cref="HapticSecrets"/>.
+    /// Central, inspector-editable configuration for the AI haptics pipeline. Since the prompting
+    /// move, the LLM prompt chain and the Gemini API key live on the backend server — not here.
+    /// This asset now configures only the on-device pieces: the offline fallback synth, the cache,
+    /// playback, and how a backend request behaves. The backend URL itself is a secret, kept out of
+    /// source control in <see cref="HapticSecrets"/>.
     /// </summary>
     [CreateAssetMenu(fileName = "HapticAIConfig", menuName = "HapticAI/Config")]
     public sealed class HapticAIConfig : ScriptableObject
     {
-        [Header("Synthesis provider")]
-        public SynthProviderKind provider = SynthProviderKind.Mock;
+        [Header("Generation")]
         [Tooltip("Requested clip length (seconds) for generated haptics.")]
         public float clipDurationSeconds = 1.0f;
         [Tooltip("Gain applied when converting the waveform to controller amplitudes.")]
         public float amplitudeGain = 1.4f;
 
-        [Header("Mock provider (no server)")]
+        [Header("Backend service")]
+        [Tooltip("Force on-device offline synthesis even when a service URL is configured (useful for testing).")]
+        public bool forceOfflineSynthesis = false;
+        [Tooltip("HTTP timeout (seconds) for a backend request before falling back to on-device synthesis.")]
+        public int requestTimeoutSeconds = 30;
+
+        [Header("On-device offline synth (no server / fallback)")]
         public int mockSampleRate = 8000;
         [Tooltip("Fake network latency to exercise the hybrid fallback path in-editor.")]
         public int mockLatencyMs = 0;
-
-        [Header("Prompt chain (Gemini)")]
-        [Tooltip("When off, an offline template stage is used instead of Gemini (runs with no key).")]
-        public bool useGemini = true;
-        public string geminiModel = "gemini-2.5-flash";
-        public string geminiEndpointBase = "https://generativelanguage.googleapis.com/v1beta";
-        [Tooltip("Chain of Gemini stages, run top to bottom. Add/reorder to change prompt generation.")]
-        public List<PromptStageTemplate> promptStages = new List<PromptStageTemplate>
-        {
-            new PromptStageTemplate
-            {
-                name = "environment-summary",
-                systemInstruction = "You describe a VR fire-training moment in one vivid sentence, " +
-                                    "focusing on the physical sensation a hand would feel.",
-                userTemplate = "Cues: {brief}\nSummarise the moment in one sentence.",
-            },
-            new PromptStageTemplate
-            {
-                name = "haptic-design-brief",
-                systemInstruction = "You are a haptics designer. Turn a described moment into a short " +
-                                    "brief naming texture, sharpness, rhythm and how it evolves over time.",
-                userTemplate = "Moment: {input}\nWrite the haptic design brief.",
-            },
-            new PromptStageTemplate
-            {
-                name = "haptigen-prompt",
-                systemInstruction = "You write concise text prompts for a text-to-haptics model (HaptiGen). " +
-                                    "Output ONLY the prompt, one line, no preamble.",
-                userTemplate = "Design brief: {input}\nWrite the HaptiGen prompt.",
-            },
-        };
 
         [Header("Cache")]
         [Tooltip("Bucket granularity for numeric cues when forming cache keys (higher = more variety).")]

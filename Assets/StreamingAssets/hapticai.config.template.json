@@ -1,5 +1,4 @@
 {
-  "_comment": "Copy this file to 'hapticai.local.json' (same folder) and fill in your values. hapticai.local.json is gitignored so your secrets never get committed. Leave a value empty to disable that feature: empty geminiApiKey -> the offline prompt stage is used; empty hapticGenUrl -> the mock haptic synth is used.",
-  "geminiApiKey": "",
-  "hapticGenUrl": ""
+  "_comment": "Copy this file to 'hapticai.local.json' (same folder) and set your backend URL. hapticai.local.json is gitignored so it never gets committed. Leave hapticServiceUrl empty to run the scene fully on-device (offline mock synth, no server). The Gemini API key is NO LONGER set here — prompt generation runs on the backend, which reads GEMINI_API_KEY from its own environment.",
+  "hapticServiceUrl": ""
 }

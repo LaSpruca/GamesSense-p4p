@@ -12,9 +12,10 @@ namespace HapticAI.Synth
     }
 
     /// <summary>
-    /// Turns a text prompt into a vibrotactile <see cref="Waveform"/>. The real implementation
-    /// (<see cref="HaptiGenHttpSynth"/>) calls a hosted HaptiGen server; <see cref="MockHapticSynth"/>
-    /// is a fully local stand-in so the scene runs with no server. Swap providers via config.
+    /// Turns a text prompt into a vibrotactile <see cref="Waveform"/> on-device. The only remaining
+    /// implementation is <see cref="MockHapticSynth"/>, the local offline stand-in. The real HaptiGen
+    /// synthesis now runs on the backend (server/hapticgen_server.py) and reaches the scene through
+    /// the remote waveform source, so it no longer needs an on-device provider.
     /// </summary>
     public interface IHapticSynthProvider
     {

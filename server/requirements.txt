@@ -4,3 +4,8 @@ fastapi>=0.110
 uvicorn[standard]>=0.29
 pydantic>=2.0
 numpy>=1.24
+# Prompt generation (the Gemini chain) now runs server-side. Optional: without a
+# GEMINI_API_KEY the /haptics endpoint uses the offline template instead.
+google-generativeai>=0.8
+# Optional: auto-loads a server/.env (e.g. GEMINI_API_KEY=...) on startup.
+python-dotenv>=1.0
