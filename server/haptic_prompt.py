@@ -31,13 +31,26 @@ except ImportError:
     pass
 
 # Gemini is optional: the module runs (offline template) without it installed/configured.
+# google-genai is the current SDK; the older google-generativeai package is deprecated and cannot
+# control thinking budgets, which matters here (see THINKING_LEVEL below).
 try:
-    import google.generativeai as genai
+    from google import genai
+    from google.genai import types as genai_types
 except Exception:  # pragma: no cover - only needed when a key is configured
     genai = None
+    genai_types = None
 
 
-DEFAULT_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+# Pinned rather than an alias like gemini-flash-latest: the model wording drives the haptic that
+# gets generated, so a silent model change would silently change how the sim feels. Override with
+# GEMINI_MODEL. (gemini-2.5-flash, the previous default, is no longer served to new keys.)
+DEFAULT_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
+
+# Gemini 3 models think before answering, and thinking tokens come out of max_output_tokens. Each
+# stage here is a short rewrite, not a reasoning problem, so budget thinking low and leave room for
+# the answer -- otherwise the visible text gets cut off mid-sentence.
+THINKING_LEVEL = os.environ.get("GEMINI_THINKING_LEVEL", "low")
+MAX_OUTPUT_TOKENS = 2048
 
 
 # --- Prompt chain definition (ports HapticAIConfig.cs promptStages defaults) ----------------
@@ -181,7 +194,7 @@ def run_prompt_chain(
         return PromptResult(prompt=_offline_prompt(brief), trace=[f"[offline] {brief}"], used_gemini=False)
 
     stages = stages or DEFAULT_PROMPT_STAGES
-    genai.configure(api_key=os.environ["GEMINI_API_KEY"])
+    client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
 
     current = brief  # PromptState.Current starts as the context brief.
     trace: List[str] = []
@@ -192,12 +205,25 @@ def run_prompt_chain(
             .replace("{brief}", brief)
             .replace("{event}", label)
         )
-        model = genai.GenerativeModel(model_name, system_instruction=stage.system_instruction)
-        resp = model.generate_content(
-            user_text,
-            generation_config={"temperature": 0.7, "max_output_tokens": 256},
-        )
-        text = (getattr(resp, "text", None) or "").strip()
+        try:
+            resp = client.models.generate_content(
+                model=model_name,
+                contents=user_text,
+                config=genai_types.GenerateContentConfig(
+                    system_instruction=stage.system_instruction,
+                    temperature=0.7,
+                    max_output_tokens=MAX_OUTPUT_TOKENS,
+                    thinking_config=genai_types.ThinkingConfig(thinking_level=THINKING_LEVEL),
+                ),
+            )
+            text = (getattr(resp, "text", None) or "").strip()
+        except Exception as e:
+            # A dead model name, a rate limit, or no network must not take the endpoint down --
+            # the headset still needs a waveform. Drop to the offline template for this request.
+            print(f"[gemini] stage '{stage.name}' failed ({e}); using the offline template.")
+            return PromptResult(prompt=_offline_prompt(brief),
+                                trace=trace + [f"[offline after {stage.name} failed] {e}"],
+                                used_gemini=False)
         if not text:
             # If a stage returns nothing, keep the previous text rather than blanking the chain.
             text = current
