@@ -48,7 +48,9 @@ namespace HapticAI.Pipeline
                 if (_fallback == null) throw;
                 Debug.LogWarning($"[HapticAI] Remote haptic service failed ({e.Message}); " +
                                  "falling back to on-device synthesis.");
-                return await _fallback.GenerateAsync(evt, options, ct);
+                var degraded = await _fallback.GenerateAsync(evt, options, ct);
+                degraded.IsDegraded = true;   // keep for this session, but never persist it
+                return degraded;
             }
         }
 

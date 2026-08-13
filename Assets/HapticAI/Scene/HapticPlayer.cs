@@ -22,9 +22,28 @@ namespace HapticAI.Scene
             }
         }
 
+        bool _warnedNoHaptics;
+
         public void Play(HapticClipData data, HapticHand hand = HapticHand.Right)
         {
             if (data == null || data.Amplitudes.Length == 0) return;
+
+            // OVRHaptics.Config stays zeroed until the runtime reports a haptics-capable controller.
+            // That is the permanent state under the Meta XR Simulator, and briefly true on a headset
+            // before initialisation. OVRHapticsClip's constructor divides by SampleSizeInBytes, so
+            // without this guard every ignite/spread/spray tick throws DivideByZeroException — once
+            // per frame while spraying — and takes the caller's event handler down with it.
+            if (OVRHaptics.Config.SampleSizeInBytes <= 0)
+            {
+                if (!_warnedNoHaptics)
+                {
+                    _warnedNoHaptics = true;
+                    Debug.LogWarning("[HapticAI] No haptics-capable controller reported by the runtime " +
+                                     "(normal in the XR Simulator) — clips will be generated and cached " +
+                                     "but not played.");
+                }
+                return;
+            }
 
             var clip = new OVRHapticsClip(data.Amplitudes, data.Amplitudes.Length);
             var channel = hand == HapticHand.Left ? OVRHaptics.LeftChannel : OVRHaptics.RightChannel;

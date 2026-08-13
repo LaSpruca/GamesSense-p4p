@@ -21,7 +21,20 @@ namespace HapticAI.Config
         {
             var source = BuildWaveformSource(cfg, secrets);
             var pipeline = new HapticPipeline(source, sampleRateHz, cfg.clipDurationSeconds, cfg.amplitudeGain);
-            var cache = new HapticClipCache(cfg.cacheBuckets);
+
+            // Persist clips across sessions unless explicitly disabled: generation is a 17-34 s
+            // backend round trip, so a session-only cache pays that cost on every run.
+            HapticClipStore store = null;
+            if (cfg.persistClipCache)
+            {
+                string profile = HapticClipStore.ProfileFor(sampleRateHz, cfg.clipDurationSeconds, cfg.amplitudeGain);
+                store = new HapticClipStore(profile);
+            }
+
+            var cache = new HapticClipCache(cfg.cacheBuckets, store);
+            if (store != null)
+                Debug.Log($"[HapticAI] Clip cache: {cache.Count} clip(s) restored from {store.Directory}");
+
             return new HapticDirector(pipeline, cache, sampleRateHz);
         }
 

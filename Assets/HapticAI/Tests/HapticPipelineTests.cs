@@ -59,6 +59,73 @@ namespace HapticAI.Tests
         }
 
         [Test]
+        public void Cache_CollapsesDistancesThatProduceTheSamePrompt()
+        {
+            // The backend describes distance with three descriptors only, so two fires that differ
+            // by a few metres generate an identical clip and must share a cache entry.
+            var cache = new HapticClipCache();
+            var far1 = new HapticEvent(HapticEventType.Spread).WithNumber("distance", 4.0f);
+            var far2 = new HapticEvent(HapticEventType.Spread).WithNumber("distance", 4.3f);
+            Assert.AreEqual(cache.KeyFor(far1), cache.KeyFor(far2));
+
+            // ...but the three bands themselves must stay distinct.
+            var close = new HapticEvent(HapticEventType.Spread).WithNumber("distance", 0.2f);
+            var arm = new HapticEvent(HapticEventType.Spread).WithNumber("distance", 1.0f);
+            Assert.AreNotEqual(cache.KeyFor(close), cache.KeyFor(arm));
+            Assert.AreNotEqual(cache.KeyFor(arm), cache.KeyFor(far1));
+        }
+
+        [Test]
+        public void Store_RoundTripsClipsAcrossSessions()
+        {
+            // The whole point of the store: a fresh cache (i.e. a new play session) must come back
+            // populated, so it issues no backend requests at all.
+            string root = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "haptic-clip-store-test-" + System.Guid.NewGuid().ToString("N"));
+            try
+            {
+                var store = new HapticClipStore("test-profile", root);
+                var written = new HapticClipCache(4, store);
+                var amplitudes = new byte[] { 0, 64, 255, 12 };
+                written.Put(new HapticClipData("Ignite|intensity=3", amplitudes, 320, "a sharp jolt"));
+
+                var reloaded = new HapticClipCache(4, new HapticClipStore("test-profile", root));
+                Assert.AreEqual(1, reloaded.Count, "clip should survive into a new session");
+                Assert.IsTrue(reloaded.TryGet("Ignite|intensity=3", out var clip));
+                CollectionAssert.AreEqual(amplitudes, clip.Amplitudes);
+                Assert.AreEqual(320, clip.SampleRateHz);
+                Assert.AreEqual("a sharp jolt", clip.Prompt);
+            }
+            finally
+            {
+                if (System.IO.Directory.Exists(root)) System.IO.Directory.Delete(root, true);
+            }
+        }
+
+        [Test]
+        public void Store_SeparatesProfilesSoGainChangesInvalidate()
+        {
+            // Amplitude gain / duration / sample rate change the bytes but not the cache key, so a
+            // different profile must not serve clips baked under the old settings.
+            string root = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "haptic-clip-store-test-" + System.Guid.NewGuid().ToString("N"));
+            try
+            {
+                var a = HapticClipStore.ProfileFor(320, 1.0f, 1.4f);
+                var b = HapticClipStore.ProfileFor(320, 1.0f, 0.7f);
+                Assert.AreNotEqual(a, b, "different gain must produce a different profile");
+
+                new HapticClipCache(4, new HapticClipStore(a, root))
+                    .Put(new HapticClipData("k", new byte[] { 9 }, 320));
+
+                var other = new HapticClipCache(4, new HapticClipStore(b, root));
+                Assert.AreEqual(0, other.Count, "a different profile must not reuse the old clips");
+            }
+            finally
+            {
+                if (System.IO.Directory.Exists(root)) System.IO.Directory.Delete(root, true);
+            }
+        }
+
+        [Test]
         public async Task PromptChain_RunsStagesInOrderThreadingOutput()
         {
             var ctx = new HapticContext(new HapticEvent(HapticEventType.Ignite));

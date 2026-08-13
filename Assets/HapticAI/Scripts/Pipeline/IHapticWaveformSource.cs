@@ -15,6 +15,14 @@ namespace HapticAI.Pipeline
         public Waveform Waveform;
         public string Prompt;
         public IReadOnlyList<string> Trace;
+
+        /// <summary>
+        /// True when this came from a degraded path — i.e. the backend was meant to generate it but
+        /// failed, so the on-device synth stood in. Still worth playing and worth keeping for the
+        /// session, but it must never be written to the persistent cache: otherwise one network
+        /// timeout would pin the inferior clip for that event forever instead of being retried.
+        /// </summary>
+        public bool IsDegraded;
     }
 
     /// <summary>

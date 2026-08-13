@@ -32,6 +32,9 @@ namespace HapticAI.Config
         [Header("Cache")]
         [Tooltip("Bucket granularity for numeric cues when forming cache keys (higher = more variety).")]
         public int cacheBuckets = 4;
+        [Tooltip("Persist generated clips to disk so later sessions start instantly instead of " +
+                 "re-running the backend (17-34s per clip). Disable to force regeneration.")]
+        public bool persistClipCache = true;
 
         [Header("Playback")]
         [Tooltip("Overridden at runtime by OVRHaptics.Config.SampleRateHz; edit only for tests.")]

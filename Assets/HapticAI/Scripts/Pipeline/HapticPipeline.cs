@@ -40,7 +40,8 @@ namespace HapticAI.Pipeline
             var result = await _source.GenerateAsync(evt, opts, ct);
             var amps = WaveformToAmplitudes.Convert(result.Waveform, _targetSampleRateHz, _amplitudeGain);
 
-            return new HapticClipData(key, amps, _targetSampleRateHz, result.Prompt, result.Trace);
+            return new HapticClipData(key, amps, _targetSampleRateHz, result.Prompt, result.Trace,
+                isDegraded: result.IsDegraded);
         }
     }
 }
