@@ -7,6 +7,20 @@ using UnityEngine;
 
 namespace HapticAI.Config
 {
+    /// <summary>The assembled haptics stack, plus what it is actually going to generate with.</summary>
+    public struct HapticStack
+    {
+        public HapticDirector Director;
+        /// <summary>True when events go to the HaptiGen backend; false when everything is the on-device mock.</summary>
+        public bool UsingBackend;
+        /// <summary>One line for the log and the on-headset readout, e.g. "HaptiGen backend (localhost:8080)".</summary>
+        public string SourceDescription;
+        /// <summary>Backend base URL, or empty when running on-device only.</summary>
+        public string ServiceUrl;
+        /// <summary>Clips already on disk for this profile at startup.</summary>
+        public int CachedClipCount;
+    }
+
     /// <summary>
     /// Assembles a ready-to-use <see cref="HapticDirector"/> from a <see cref="HapticAIConfig"/>
     /// plus runtime secrets. This is the single wiring point. Since the prompting move it decides
@@ -17,17 +31,44 @@ namespace HapticAI.Config
     /// </summary>
     public static class HapticPipelineFactory
     {
-        public static HapticDirector Build(HapticAIConfig cfg, HapticSecrets secrets, int sampleRateHz)
+        public static HapticStack Build(HapticAIConfig cfg, HapticSecrets secrets, int sampleRateHz)
         {
-            var source = BuildWaveformSource(cfg, secrets);
-            var pipeline = new HapticPipeline(source, sampleRateHz, cfg.clipDurationSeconds, cfg.amplitudeGain);
+            var local = BuildLocalSource(cfg);
+
+            bool hasUrl = !string.IsNullOrEmpty(secrets?.hapticServiceUrl);
+            bool usingBackend = hasUrl && !cfg.forceOfflineSynthesis;
+
+            IHapticWaveformSource source = usingBackend
+                ? new RemoteWaveformSource(secrets.hapticServiceUrl, local, cfg.requestTimeoutSeconds)
+                : local;
+
+            string description;
+            if (usingBackend)
+            {
+                description = $"HaptiGen backend ({secrets.hapticServiceUrl})";
+            }
+            else if (cfg.forceOfflineSynthesis)
+            {
+                description = "on-device mock synth (forceOfflineSynthesis is on)";
+                Debug.LogWarning("[HapticAI] forceOfflineSynthesis is enabled - the backend will not be " +
+                                 "called even though a URL is configured.");
+            }
+            else
+            {
+                description = "on-device mock synth (no service URL)";
+            }
+            Debug.Log($"[HapticAI] Waveform source: {description}");
+
+            var pipeline = new HapticPipeline(source, sampleRateHz, cfg.clipDurationSeconds,
+                cfg.amplitudeGain, cfg.textureDepth);
 
             // Persist clips across sessions unless explicitly disabled: generation is a 17-34 s
             // backend round trip, so a session-only cache pays that cost on every run.
             HapticClipStore store = null;
             if (cfg.persistClipCache)
             {
-                string profile = HapticClipStore.ProfileFor(sampleRateHz, cfg.clipDurationSeconds, cfg.amplitudeGain);
+                string profile = HapticClipStore.ProfileFor(sampleRateHz, cfg.clipDurationSeconds,
+                    cfg.amplitudeGain, cfg.textureDepth, usingBackend ? "srv" : "mock");
                 store = new HapticClipStore(profile);
             }
 
@@ -35,25 +76,14 @@ namespace HapticAI.Config
             if (store != null)
                 Debug.Log($"[HapticAI] Clip cache: {cache.Count} clip(s) restored from {store.Directory}");
 
-            return new HapticDirector(pipeline, cache, sampleRateHz);
-        }
-
-        static IHapticWaveformSource BuildWaveformSource(HapticAIConfig cfg, HapticSecrets secrets)
-        {
-            // On-device offline generator: context → offline template → mock synth. Always built —
-            // used both as standalone offline mode and as the remote source's failure fallback.
-            var local = BuildLocalSource(cfg);
-
-            bool hasUrl = !string.IsNullOrEmpty(secrets?.hapticServiceUrl);
-            if (cfg.forceOfflineSynthesis || !hasUrl)
+            return new HapticStack
             {
-                if (!hasUrl && !cfg.forceOfflineSynthesis)
-                    Debug.LogWarning("[HapticAI] No haptic service URL configured — " +
-                                     "using on-device offline synthesis (mock).");
-                return local;
-            }
-
-            return new RemoteWaveformSource(secrets.hapticServiceUrl, local, cfg.requestTimeoutSeconds);
+                Director = new HapticDirector(pipeline, cache, sampleRateHz),
+                UsingBackend = usingBackend,
+                SourceDescription = description,
+                ServiceUrl = usingBackend ? secrets.hapticServiceUrl : string.Empty,
+                CachedClipCount = cache.Count,
+            };
         }
 
         static LocalWaveformSource BuildLocalSource(HapticAIConfig cfg)

@@ -6,26 +6,50 @@ using Meta.XR.MRUtilityKit;
 namespace FireSim
 {
     /// <summary>
-    /// Owns the fire in the scene. When MRUK finishes loading the room it ignites a single
-    /// initial fire on a detected surface, then on a timer spreads existing fire to nearby
-    /// points on detected surfaces. Crucially it NEVER ignites a fresh, independent fire:
-    /// every new patch grows out of an existing burning patch, so once the user extinguishes
-    /// every patch the simulation is over.
+    /// Owns the fire in the scene. MRUK hands it the room via <see cref="OnSceneReady"/>; the
+    /// session then calls <see cref="Begin"/> to light the first fire, which spreads to nearby
+    /// points on detected surfaces on a timer. Crucially it NEVER ignites a fresh, independent
+    /// fire: every new patch grows out of an existing burning patch, so once the user extinguishes
+    /// every patch the run is over and <see cref="AllExtinguished"/> fires.
+    ///
+    /// Ignition is deliberately NOT automatic on room load. The room can take several seconds to
+    /// arrive and the haptics cache several more, and a fire that starts during that window burns
+    /// unattended while the user is still reading the briefing. The session decides when to start.
     /// </summary>
     public class SurfaceFireManager : MonoBehaviour
     {
         [Header("Fire patch")]
         [Tooltip("Visual/collider radius of each burning patch, in metres.")]
         public float spotRadius = 0.14f;
+        [Tooltip("How far the flame column rises off the surface. Foam damage is graded over this " +
+                 "height, so it is also the size of the 'aim at the base' target.")]
+        public float flameHeight = 0.5f;
         public float spotHealth = 100f;
-        [Tooltip("Health removed per foam particle that strikes a patch.")]
-        public float foamDamagePerParticle = 1.6f;
+        [Tooltip("Health removed by one foam particle striking the BASE of the flames. A well-aimed " +
+                 "spray lands 100-180 particles/s on a patch, so this sets the kill time directly.")]
+        public float foamDamagePerParticle = 0.45f;
+        [Tooltip("Damage multiplier for foam hitting the top of the flames instead of the base.")]
+        [Range(0f, 1f)] public float topOfFlameDamageScale = 0.15f;
+
+        [Header("Recovery")]
+        [Tooltip("Seconds without foam before a knocked-down patch starts climbing back.")]
+        public float recoveryDelay = 1.5f;
+        [Tooltip("Health per second regained once recovery starts. Must stay well below the damage " +
+                 "rate of an accurate spray, or a patch becomes unkillable.")]
+        public float recoveryRate = 14f;
 
         [Header("Spreading")]
+        [Tooltip("Seconds of grace after ignition before fire can spread at all.")]
+        public float firstSpreadDelay = 4f;
         [Tooltip("Seconds between spread attempts.")]
-        public float spreadInterval = 2.5f;
-        [Tooltip("Chance (0-1) that a given burning patch spreads on each tick.")]
-        [Range(0f, 1f)] public float spreadChance = 0.5f;
+        public float spreadInterval = 1.75f;
+        [Tooltip("Chance (0-1) that a given eligible patch spreads on each tick.")]
+        [Range(0f, 1f)] public float spreadChance = 0.55f;
+        [Tooltip("Hard cap on new patches per tick, so a large fire cannot snowball out of reach.")]
+        public int maxSpreadsPerTick = 2;
+        [Tooltip("A patch below this health fraction is too weak to spread. Knocking a patch down " +
+                 "therefore slows the fire even before it goes out.")]
+        [Range(0f, 1f)] public float spreadHealthThreshold = 0.5f;
         [Tooltip("How far a new patch appears from its parent, in metres.")]
         public float spreadDistanceMin = 0.22f;
         public float spreadDistanceMax = 0.45f;
@@ -34,7 +58,7 @@ namespace FireSim
         [Tooltip("Minimum spacing between patches so they don't stack up.")]
         public float minSpotSpacing = 0.28f;
         [Tooltip("Upper bound on simultaneous burning patches.")]
-        public int maxSpots = 40;
+        public int maxSpots = 24;
 
         [Header("What can burn")]
         [Tooltip("Surfaces fire is allowed to live on. The initial fire prefers tables/storage, then the floor.")]
@@ -47,15 +71,30 @@ namespace FireSim
         readonly List<MRUKAnchor> _flammableAnchors = new List<MRUKAnchor>();
         MRUKRoom _room;
         Transform _fireRoot;
+        Coroutine _spreadLoop;
 
         public int BurningCount => _spots.Count;
+        /// <summary>True once MRUK has handed over a room with at least one flammable surface.</summary>
+        public bool RoomReady { get; private set; }
+        /// <summary>True between <see cref="Begin"/> and the last patch going out.</summary>
+        public bool RunActive { get; private set; }
+        /// <summary>Patches lit this run, including the first one.</summary>
+        public int TotalIgnited { get; private set; }
+        /// <summary>Patches the user put out this run.</summary>
+        public int TotalExtinguished { get; private set; }
+        /// <summary>The most patches burning at once this run - a rough "how close did it get" score.</summary>
+        public int PeakBurning { get; private set; }
 
-        /// <summary>Raised for the very first fire of the scene.</summary>
+        /// <summary>Raised once MRUK has produced a usable room. The session waits on this.</summary>
+        public event System.Action RoomBecameReady;
+        /// <summary>Raised for the very first fire of a run.</summary>
         public event System.Action<FireSpot> SpotIgnited;
         /// <summary>Raised each time fire spreads to a new patch.</summary>
         public event System.Action<FireSpot> SpotSpread;
-        /// <summary>Raised as a patch is extinguished. The AI haptics scene listens to these.</summary>
+        /// <summary>Raised as a patch is extinguished.</summary>
         public event System.Action<FireSpot> SpotExtinguished;
+        /// <summary>Raised when the last burning patch goes out - i.e. the user has finished.</summary>
+        public event System.Action AllExtinguished;
 
         void Awake()
         {
@@ -63,7 +102,7 @@ namespace FireSim
             _fireRoot.SetParent(transform, false);
         }
 
-        /// <summary>Wired to MRUK's SceneLoadedEvent by the bootstrap.</summary>
+        /// <summary>Wired to MRUK's SceneLoadedEvent by the bootstrap. Does not start the fire.</summary>
         public void OnSceneReady()
         {
             _room = MRUK.Instance != null ? MRUK.Instance.GetCurrentRoom() : null;
@@ -75,13 +114,52 @@ namespace FireSim
             }
 
             CollectFlammableAnchors();
+            RoomReady = true;
+            RoomBecameReady?.Invoke();
+        }
+
+        /// <summary>
+        /// Light the first fire and start the spread loop. Safe to call again after a run finishes;
+        /// that is what Restart does.
+        /// </summary>
+        public bool Begin()
+        {
+            if (!RoomReady)
+            {
+                Debug.LogWarning("[FireSim] Begin() called before the room was ready.");
+                return false;
+            }
+            if (RunActive) return true;
+
+            ClearAllSpots();
+            TotalIgnited = 0;
+            TotalExtinguished = 0;
+            PeakBurning = 0;
+
             if (!IgniteInitialFire())
             {
                 Debug.LogWarning("[FireSim] Could not find a flammable surface to ignite.");
-                return;
+                return false;
             }
 
-            StartCoroutine(SpreadLoop());
+            RunActive = true;
+            _spreadLoop = StartCoroutine(SpreadLoop());
+            return true;
+        }
+
+        /// <summary>Stop the run and remove every burning patch without raising AllExtinguished.</summary>
+        public void Abort()
+        {
+            RunActive = false;
+            if (_spreadLoop != null) { StopCoroutine(_spreadLoop); _spreadLoop = null; }
+            ClearAllSpots();
+        }
+
+        void ClearAllSpots()
+        {
+            foreach (var spot in _spots)
+                if (spot != null) Destroy(spot.gameObject);
+            _spots.Clear();
         }
 
         void CollectFlammableAnchors()
@@ -126,25 +204,34 @@ namespace FireSim
 
         IEnumerator SpreadLoop()
         {
+            yield return new WaitForSeconds(firstSpreadDelay);
+
             var wait = new WaitForSeconds(spreadInterval);
-            while (true)
+            while (RunActive)
             {
                 yield return wait;
                 if (_spots.Count == 0 || _spots.Count >= maxSpots) continue;
 
-                // Snapshot so we don't iterate while adding.
+                // Snapshot the count so we don't iterate over patches added by this same tick.
                 int existing = _spots.Count;
+                int spreadsThisTick = 0;
                 for (int i = 0; i < existing && _spots.Count < maxSpots; i++)
                 {
+                    if (spreadsThisTick >= maxSpreadsPerTick) break;
+
                     var spot = _spots[i];
                     if (spot == null || !spot.IsBurning) continue;
+                    // A patch you have knocked down is too weak to throw off new fire. This is the
+                    // main reason committing to one patch at a time beats spraying everything.
+                    if (spot.HealthFraction < spreadHealthThreshold) continue;
                     if (Random.value > spreadChance) continue;
-                    TrySpreadFrom(spot);
+
+                    if (TrySpreadFrom(spot)) spreadsThisTick++;
                 }
             }
         }
 
-        void TrySpreadFrom(FireSpot spot)
+        bool TrySpreadFrom(FireSpot spot)
         {
             // Pick a random direction lying in the spot's surface plane.
             Vector3 normal = spot.SurfaceNormal;
@@ -160,10 +247,11 @@ namespace FireSim
 
             // Snap the candidate onto the nearest detected surface; reject if nothing is close.
             if (!FindNearestSurfacePoint(candidate, out var surfacePos, out var surfaceNormal, out var anchor))
-                return;
-            if (IsTooCloseToExistingSpot(surfacePos)) return;
+                return false;
+            if (IsTooCloseToExistingSpot(surfacePos)) return false;
 
             SpotSpread?.Invoke(SpawnSpot(surfacePos, surfaceNormal, anchor));
+            return true;
         }
 
         bool FindNearestSurfacePoint(Vector3 worldPoint, out Vector3 closest, out Vector3 normal, out MRUKAnchor anchor)
@@ -209,8 +297,19 @@ namespace FireSim
             var go = new GameObject("FireSpot");
             go.transform.SetParent(_fireRoot, false);
             var spot = go.AddComponent<FireSpot>();
-            spot.Initialise(this, position, normal, anchor, spotRadius, spotHealth, foamDamagePerParticle);
+            spot.Initialise(this, position, normal, anchor, new FireSpotSettings
+            {
+                Radius = spotRadius,
+                FlameHeight = flameHeight,
+                Health = spotHealth,
+                FoamDamagePerParticle = foamDamagePerParticle,
+                TopOfFlameDamageScale = topOfFlameDamageScale,
+                RecoveryDelay = recoveryDelay,
+                RecoveryRate = recoveryRate,
+            });
             _spots.Add(spot);
+            TotalIgnited++;
+            if (_spots.Count > PeakBurning) PeakBurning = _spots.Count;
             return spot;
         }
 
@@ -218,8 +317,14 @@ namespace FireSim
         {
             SpotExtinguished?.Invoke(spot);
             _spots.Remove(spot);
-            if (_spots.Count == 0)
-                Debug.Log("[FireSim] All fire extinguished. Well done!");
+            TotalExtinguished++;
+
+            if (_spots.Count != 0 || !RunActive) return;
+
+            RunActive = false;
+            if (_spreadLoop != null) { StopCoroutine(_spreadLoop); _spreadLoop = null; }
+            Debug.Log($"[FireSim] All fire extinguished after {TotalExtinguished} patch(es).");
+            AllExtinguished?.Invoke();
         }
     }
 }

@@ -21,12 +21,24 @@ namespace FireSim
         public float hapticFrequency = 0.6f;
         public float hapticMaxAmplitude = 0.7f;
         [Tooltip("When false, the built-in scalar rumble is skipped so an external system (e.g. the " +
-                 "AI haptics pipeline) can drive haptics via the Spraying event instead.")]
+                 "AI haptics pipeline) can drive haptics via the spray events instead.")]
         public bool useBuiltInHaptics = true;
 
         /// <summary>
+        /// Whether the trigger does anything. The session disarms the extinguisher outside a run so
+        /// the user can't hose the room while the briefing is still up.
+        /// </summary>
+        public bool Armed { get; set; }
+
+        public bool IsSpraying => _spraying;
+
+        /// <summary>Raised on the frame spraying starts, with the trigger value (0-1).</summary>
+        public event System.Action<float> SprayStarted;
+        /// <summary>Raised on the frame spraying stops.</summary>
+        public event System.Action SprayStopped;
+        /// <summary>
         /// Raised every frame while foam is spraying, with the current trigger value (0-1). The AI
-        /// haptics scene subscribes to this to generate spray haptics; the original scene ignores it.
+        /// haptics path subscribes to this to track spray force; static mode ignores it.
         /// </summary>
         public event System.Action<float> Spraying;
 
@@ -83,7 +95,7 @@ namespace FireSim
         void Update()
         {
             float trigger = OVRInput.Get(OVRInput.Axis1D.PrimaryIndexTrigger, OVRInput.Controller.RTouch);
-            bool wantSpray = trigger >= triggerThreshold;
+            bool wantSpray = Armed && trigger >= triggerThreshold;
 
             if (wantSpray)
             {
@@ -94,25 +106,31 @@ namespace FireSim
                     float amplitude = Mathf.Lerp(0.15f, hapticMaxAmplitude, Mathf.InverseLerp(triggerThreshold, 1f, trigger));
                     OVRInput.SetControllerVibration(hapticFrequency, amplitude, OVRInput.Controller.RTouch);
                 }
+                if (!_spraying)
+                {
+                    _spraying = true;
+                    SprayStarted?.Invoke(trigger);
+                }
                 Spraying?.Invoke(trigger);
-                _spraying = true;
             }
             else if (_spraying)
             {
-                _emission.rateOverTime = 0f;
-                if (useBuiltInHaptics)
-                    OVRInput.SetControllerVibration(0f, 0f, OVRInput.Controller.RTouch);
-                _spraying = false;
+                StopSpraying();
             }
+        }
+
+        void StopSpraying()
+        {
+            _emission.rateOverTime = 0f;
+            if (useBuiltInHaptics)
+                OVRInput.SetControllerVibration(0f, 0f, OVRInput.Controller.RTouch);
+            _spraying = false;
+            SprayStopped?.Invoke();
         }
 
         void OnDisable()
         {
-            if (_spraying)
-            {
-                OVRInput.SetControllerVibration(0f, 0f, OVRInput.Controller.RTouch);
-                _spraying = false;
-            }
+            if (_spraying) StopSpraying();
         }
     }
 }

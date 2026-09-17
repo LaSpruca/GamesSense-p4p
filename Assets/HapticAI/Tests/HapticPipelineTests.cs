@@ -109,9 +109,11 @@ namespace HapticAI.Tests
             string root = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "haptic-clip-store-test-" + System.Guid.NewGuid().ToString("N"));
             try
             {
-                var a = HapticClipStore.ProfileFor(320, 1.0f, 1.4f);
-                var b = HapticClipStore.ProfileFor(320, 1.0f, 0.7f);
+                var a = HapticClipStore.ProfileFor(320, 1.0f, 1.4f, 0.5f, "srv");
+                var b = HapticClipStore.ProfileFor(320, 1.0f, 0.7f, 0.5f, "srv");
                 Assert.AreNotEqual(a, b, "different gain must produce a different profile");
+                Assert.AreNotEqual(a, HapticClipStore.ProfileFor(320, 1.0f, 1.4f, 0.9f, "srv"),
+                    "different texture depth must produce a different profile");
 
                 new HapticClipCache(4, new HapticClipStore(a, root))
                     .Put(new HapticClipData("k", new byte[] { 9 }, 320));
@@ -192,6 +194,43 @@ namespace HapticAI.Tests
             Assert.AreEqual(samples.Length, decoded.Samples.Length);
             for (int i = 0; i < samples.Length; i++)
                 Assert.That(decoded.Samples[i], Is.EqualTo(samples[i]).Within(0.001f));
+        }
+
+        [Test]
+        public void Store_SeparatesMockClipsFromBackendClips()
+        {
+            // Run once with no service URL and the on-device mock fills the cache; without this
+            // split, a later run WITH a working backend would find every event already cached and
+            // never call it, so the fix would look like it had done nothing.
+            Assert.AreNotEqual(
+                HapticClipStore.ProfileFor(320, 1.0f, 1.4f, 0.5f, "mock"),
+                HapticClipStore.ProfileFor(320, 1.0f, 1.4f, 0.5f, "srv"),
+                "mock and backend clips must not share a cache directory");
+        }
+
+        [Test]
+        public void WaveformToAmplitudes_TextureDepthModulatesAFlatEnvelope()
+        {
+            // A constant-amplitude signal is the clearest case: its envelope is flat, so any
+            // variation in the output can only have come from the re-imposed texture.
+            var samples = new float[4000];
+            for (int i = 0; i < samples.Length; i++) samples[i] = 0.5f;
+            var wf = new Waveform(samples, 8000);
+
+            byte[] flat = WaveformToAmplitudes.Convert(wf, 320, gain: 1.4f, textureDepth: 0f);
+            byte[] textured = WaveformToAmplitudes.Convert(wf, 320, gain: 1.4f, textureDepth: 0.55f);
+
+            Assert.AreEqual(flat.Length, textured.Length);
+            foreach (var a in flat)
+                Assert.AreEqual(flat[0], a, "depth 0 must reproduce the plain peak envelope");
+
+            int min = 255, max = 0;
+            foreach (var a in textured)
+            {
+                if (a < min) min = a;
+                if (a > max) max = a;
+            }
+            Assert.Greater(max - min, 40, "textured output should swing well beyond the flat envelope");
         }
 
         /// <summary>Test double: appends "+name" to the running text so ordering is observable.</summary>

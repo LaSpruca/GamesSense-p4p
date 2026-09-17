@@ -33,9 +33,19 @@ namespace HapticAI.Cache
 
         public string Directory => _dir;
 
-        /// <summary>Profile tag for the settings that change a clip's bytes but not its cache key.</summary>
-        public static string ProfileFor(int sampleRateHz, float durationSeconds, float amplitudeGain) =>
-            $"sr{sampleRateHz}-d{durationSeconds:0.###}-g{amplitudeGain:0.###}";
+        /// <summary>
+        /// Profile tag for everything that changes a clip's bytes but not its cache key. Sample
+        /// rate, duration, gain and texture depth all re-render the amplitudes, so without this a
+        /// tweak to any of them would silently keep replaying clips baked at the old setting.
+        ///
+        /// <paramref name="sourceTag"/> separates mock clips from backend ones, which matters more
+        /// than it looks: run once with no service URL and the on-device mock fills the cache, and
+        /// from then on a correctly configured backend is never called, because every event is
+        /// already a cache hit. Different tag, different directory, no shadowing.
+        /// </summary>
+        public static string ProfileFor(int sampleRateHz, float durationSeconds, float amplitudeGain,
+            float textureDepth, string sourceTag) =>
+            $"{sourceTag}-sr{sampleRateHz}-d{durationSeconds:0.###}-g{amplitudeGain:0.###}-t{textureDepth:0.##}";
 
         /// <summary>Every clip on disk for this profile. Unreadable files are skipped, never fatal.</summary>
         public IEnumerable<HapticClipData> LoadAll()

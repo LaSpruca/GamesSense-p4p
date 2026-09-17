@@ -97,6 +97,8 @@ _EVENT_DESCRIPTORS = {
     "Spread": "flames spread to a new surface",
     "Extinguish": "a burning patch is snuffed out into a hiss of steam",
     "SprayTick": "extinguisher foam is being sprayed under pressure",
+    # Custom events are looked up by their custom_name, so this keys off "Complete".
+    "Complete": "the last flames die out and the room falls quiet, a firm settled all-clear",
 }
 
 
@@ -121,8 +123,9 @@ def build_brief(
     label = event_label(event, custom_name)
     descriptors: List[str] = []
 
-    # EventTypeContributor
-    descriptors.append(_EVENT_DESCRIPTORS.get(event, label))
+    # EventTypeContributor. Custom events carry their meaning in custom_name, so the label is
+    # tried first and the raw event type second.
+    descriptors.append(_EVENT_DESCRIPTORS.get(label, _EVENT_DESCRIPTORS.get(event, label)))
 
     # SurfaceMaterialContributor
     surface = tags.get("surface")

@@ -19,7 +19,12 @@ namespace HapticAI.Pipeline
                 case HapticEventType.SprayTick:
                     ctx.AddDescriptor("extinguisher foam is being sprayed under pressure"); break;
                 default:
-                    ctx.AddDescriptor(evt.Name); break;
+                    // Custom events describe themselves by name. Keep this table in step with
+                    // _EVENT_DESCRIPTORS in server/haptic_prompt.py, which does the same lookup.
+                    ctx.AddDescriptor(evt.Name == "Complete"
+                        ? "the last flames die out and the room falls quiet, a firm settled all-clear"
+                        : evt.Name);
+                    break;
             }
         }
     }

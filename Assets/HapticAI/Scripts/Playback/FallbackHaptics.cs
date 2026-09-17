@@ -20,8 +20,11 @@ namespace HapticAI.Playback
                 case HapticEventType.Ignite:     duration = 0.5f; level = 0.9f; decay = 6f; break;
                 case HapticEventType.Spread:     duration = 0.35f; level = 0.6f; decay = 8f; break;
                 case HapticEventType.Extinguish: duration = 0.6f; level = 0.7f; decay = 3f; break;
-                case HapticEventType.SprayTick:  duration = 0.12f; level = 0.5f; decay = 0.5f; break;
-                default:                         duration = 0.3f; level = 0.6f; decay = 5f; break;
+                // Long and slow so a sustained spray loop has something to actually loop, rather
+                // than a 120 ms tick that reads as a stutter when repeated.
+                case HapticEventType.SprayTick:  duration = 0.5f; level = 0.5f; decay = 0.2f; break;
+                // The run-complete cue: a long, settling all-clear rather than a sharp hit.
+                default:                         duration = 0.9f; level = 0.8f; decay = 2f; break;
             }
 
             // Scale by intensity/trigger cues if present.
