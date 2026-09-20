@@ -1,9 +1,10 @@
 using System.Collections.Generic;
+using System.Threading;
 using System.Threading.Tasks;
 using FireSim;
 using HapticAI.Config;
-using HapticAI.Core;
-using HapticAI.Pipeline;
+using HapticAI.Net;
+using HapticAI.Profiles;
 using Meta.XR.MRUtilityKit;
 using UnityEngine;
 
@@ -17,18 +18,19 @@ namespace HapticAI.Scene
     ///   * Insight Passthrough as an underlay, with the eye cameras cleared to transparent.
     ///   * MRUK loading the room, plus an EffectMesh producing invisible colliders on every
     ///     detected surface (so foam splashes on them and fire sits on them).
-    ///   * A SurfaceFireManager that spreads fire across those surfaces.
+    ///   * A SurfaceFireManager that runs the staged drill across those surfaces.
     ///   * A foam sprayer at the tip of the right controller, driven by the index trigger.
-    ///   * The AI haptics stack, and a TrainingSession that runs briefing → run → result.
+    ///   * The haptics stack: a palette of profiles planned for THIS room, played by the relay.
+    ///   * A TrainingSession that runs briefing → stage → notification → next stage.
     ///
-    /// This replaces the two near-identical bootstraps the project used to carry (one per scene).
-    /// Both haptics conditions now live here and are switched at runtime by the session, so a
-    /// participant can be flipped between them without a rebuild, and the static baseline can no
-    /// longer drift away from the AI build the way two hand-maintained scenes did.
-    ///
-    /// Ordering note: the MRUK room load is started FIRST and left to run while the haptics stack
-    /// builds and warms. Those two are independent and each takes seconds; doing them in sequence
-    /// (as the AI scene used to) simply added the two waits together before anything appeared.
+    /// Haptics start-up is built around never holding the trainee up:
+    ///   1. The session socket opens while the room is still loading.
+    ///   2. As soon as the room is known, a scene snapshot goes to the server; its plan comes back
+    ///      in well under a second when the room has been seen before, a few seconds otherwise.
+    ///   3. The briefing appears at that point. Clips stream in behind it (instantly from the
+    ///      headset's own store on a warm start) and procedural stand-ins cover any that have not.
+    ///   4. If the socket has not connected within the configured timeout, the on-device palette is
+    ///      adopted instead - and replaced by the server's if the socket comes up later.
     /// </summary>
     public sealed class FireTrainingBootstrap : MonoBehaviour
     {
@@ -61,10 +63,15 @@ namespace HapticAI.Scene
         TrainingSession _session;
         HapticStack _haptics;
         HapticPlayer _player;
-        string _backendStatus;
+        CancellationTokenSource _cts;
+        string _backendStatus = "unknown";
+        bool _serverPaletteAdopted;
+        bool _offlinePaletteAdopted;
+        bool _sceneSent;
 
         async void Start()
         {
+            _cts = new CancellationTokenSource();
             try
             {
                 _rig = XrRig.EnsureCameraRig();
@@ -76,29 +83,42 @@ namespace HapticAI.Scene
                 MRUK.Instance.RegisterSceneLoadedCallback(_fireManager.OnSceneReady);
 
                 BuildFoamSprayer();
+                _fireManager.AttachSprayer(_sprayer);
 
                 var secrets = await BuildHapticsAsync();
                 BuildRelay();
                 BuildSession();
 
-                // Warming is an optimisation, and its failure must not strand the user on the
-                // "getting ready" screen: whatever happens, the session is told to move on. Clips
-                // that were not pre-generated simply play a procedural stand-in the first time.
+                // Palette preparation must never strand the user on the "getting ready" screen:
+                // whatever happens, the session is told to move on.
                 try
                 {
-                    await PrepareClipsAsync(secrets);
+                    await PreparePaletteAsync(secrets, _cts.Token);
                 }
+                catch (System.OperationCanceledException) { }
                 catch (System.Exception e)
                 {
-                    Debug.LogError($"[HapticAI] Clip preparation failed: {e}");
+                    Debug.LogError($"[HapticAI] Palette preparation failed: {e}");
                     _backendStatus = "preparation failed, see log";
+                    AdoptOfflinePalette();
                 }
-                _session.SetHapticsReady(DescribeSource());
             }
             catch (System.Exception e)
             {
                 Debug.LogError($"[HapticAI] Bootstrap failed: {e}");
             }
+        }
+
+        void Update()
+        {
+            _haptics.Client?.Pump();
+        }
+
+        void OnDestroy()
+        {
+            _cts?.Cancel();
+            _cts?.Dispose();
+            _haptics.Client?.Dispose();
         }
 
         // --- Haptics ------------------------------------------------------------------------
@@ -128,7 +148,8 @@ namespace HapticAI.Scene
             var relayGo = new GameObject("FireHapticRelay");
             relayGo.transform.SetParent(transform, false);
             _relay = relayGo.AddComponent<FireHapticRelay>();
-            _relay.Initialise(_haptics.Director, _player, head, _fireManager, _sprayer, config.cacheBuckets);
+            _relay.Initialise(_haptics.Library, _haptics.Client, _player, head, _fireManager, _sprayer,
+                config.stateSendHz);
         }
 
         /// <summary>
@@ -146,80 +167,175 @@ namespace HapticAI.Scene
             var sessionGo = new GameObject("TrainingSession");
             sessionGo.transform.SetParent(transform, false);
             _session = sessionGo.AddComponent<TrainingSession>();
-            _session.Initialise(_fireManager, _sprayer, _relay, _player, head, mode, settings);
+            _session.Initialise(_fireManager, _sprayer, _relay, _haptics.Library, _player, head, mode, settings);
         }
 
-        /// <summary>
-        /// Confirm the backend is really there, then pre-generate the canonical clips so runtime
-        /// events are instant hits.
-        ///
-        /// The health check is not just diagnostics: with an unreachable backend, every warm request
-        /// would sit through the full HTTP timeout before falling back, turning a quick start into a
-        /// 30-second stall for clips that end up coming from the on-device synth anyway - and the
-        /// on-device synth is instant, so there is nothing worth pre-generating. Checking first lets
-        /// that case skip straight to the briefing, and say so on the panel instead of hiding it.
-        /// </summary>
-        async Task PrepareClipsAsync(HapticSecrets secrets)
+        // --- Palette ------------------------------------------------------------------------
+
+        async Task PreparePaletteAsync(HapticSecrets secrets, CancellationToken ct)
         {
             if (!_haptics.UsingBackend)
             {
-                Debug.LogWarning("[HapticAI] Running without a backend - clips come from the on-device " +
-                                 "mock synth. Skipping cache warm (mock generation is instant).");
+                Debug.LogWarning("[HapticAI] Running without a server - the palette comes from the on-device " +
+                                 "mock synth.");
+                await WaitForRoomAsync(ct);
+                AdoptOfflinePalette();
                 return;
             }
 
+            var client = _haptics.Client;
+            client.Connected += OnSocketConnected;
+            client.Disconnected += OnSocketDisconnected;
+            client.ProfilesReceived += OnProfilesReceived;
+            client.ClipReceived += OnClipReceived;
+            client.Start();
+
+            // /health is cheap and answers the operator's real question ("is the laptop really
+            // reachable?") on the briefing panel, independently of the socket's own retries.
             var probe = await HapticSecrets.ProbeAsync(secrets.hapticServiceUrl);
             _backendStatus = probe.Message;
-            if (!probe.Reachable)
+            _session.UpdateHapticSource(DescribeSource());
+
+            await WaitForRoomAsync(ct);
+            TrySendScene();
+
+            // Give the server its chance; then stop waiting. The socket keeps retrying in the
+            // background and the server palette replaces the offline one whenever it arrives.
+            float deadline = Time.realtimeSinceStartup + Mathf.Max(2, config.connectTimeoutSeconds);
+            while (!_serverPaletteAdopted && Time.realtimeSinceStartup < deadline)
             {
-                Debug.LogWarning("[HapticAI] Skipping cache warm - the backend did not answer.");
+                ct.ThrowIfCancellationRequested();
+                await Task.Yield();
+            }
+            if (!_serverPaletteAdopted)
+            {
+                Debug.LogWarning("[HapticAI] No palette from the server yet - starting on the on-device palette.");
+                AdoptOfflinePalette();
+            }
+        }
+
+        async Task WaitForRoomAsync(CancellationToken ct)
+        {
+            while (!_fireManager.RoomReady)
+            {
+                ct.ThrowIfCancellationRequested();
+                await Task.Yield();
+            }
+        }
+
+        void OnSocketConnected()
+        {
+            _sceneSent = false;
+            TrySendScene();
+            _session?.UpdateHapticSource(DescribeSource());
+        }
+
+        void OnSocketDisconnected(string reason)
+        {
+            _session?.UpdateHapticSource(DescribeSource());
+        }
+
+        /// <summary>Send the scene snapshot once per connection, as soon as both are available.</summary>
+        void TrySendScene()
+        {
+            if (_sceneSent || !_fireManager.RoomReady) return;
+            var client = _haptics.Client;
+            if (client == null || client.State != HapticSessionClient.Status.Connected) return;
+
+            var snapshot = BuildSceneSnapshot();
+            // Clips are requested explicitly after the plan arrives, so a set already on this
+            // headset costs the server nothing.
+            _sceneSent = client.Send(new HapticWire.Scene { scene = snapshot, refresh = false, send_clips = false });
+            if (_sceneSent) Debug.Log($"[HapticAI] Scene snapshot sent: {JsonUtility.ToJson(snapshot)}");
+        }
+
+        HapticWire.SceneSnapshot BuildSceneSnapshot()
+        {
+            var surfaces = new List<string>(_fireManager.RoomSurfaceLabels);
+            surfaces.Sort(System.StringComparer.Ordinal);
+            var size = _fireManager.RoomSize;
+            var stages = new HapticWire.StageSnapshot[TrainingStages.Count];
+            for (int i = 0; i < stages.Length; i++)
+            {
+                var s = TrainingStages.All[i];
+                stages[i] = new HapticWire.StageSnapshot
+                {
+                    index = s.Index,
+                    name = s.Name,
+                    aim = s.AimLabel,
+                    spread = s.SpreadEnabled,
+                    sweep_sectors = s.SweepSectors,
+                    reignite = s.ReigniteEnabled,
+                };
+            }
+            return new HapticWire.SceneSnapshot
+            {
+                room = new HapticWire.RoomSnapshot
+                {
+                    surfaces = surfaces.ToArray(),
+                    size_m = new[] { Round1(size.x), Round1(size.y), Round1(size.z) },
+                    anchors = _fireManager.RoomAnchorCount,
+                },
+                extinguisher = new HapticWire.ExtinguisherSnapshot(),
+                stages = stages,
+            };
+        }
+
+        static float Round1(float v) => Mathf.Round(v * 10f) / 10f;
+
+        void OnProfilesReceived(HapticWire.Profiles message)
+        {
+            if (message?.profiles == null || message.profiles.Length == 0)
+            {
+                Debug.LogWarning("[HapticAI] Server sent an empty palette.");
                 return;
             }
 
-            await _haptics.Director.WarmAsync(WarmSet());
-            Debug.Log("[HapticAI] Cache warm complete.");
+            var profiles = new List<HapticProfile>(message.profiles.Length);
+            foreach (var p in message.profiles)
+                profiles.Add(new HapticProfile(p.id, p.role, p.prompt, p.duration_s, p.loop, p.gain));
+            var set = new HapticProfileSet(message.set_id, message.scene_key, message.source, message.notes, profiles);
+
+            var missing = _haptics.Library.AdoptManifest(set);
+            _serverPaletteAdopted = true;
+            Debug.Log($"[HapticAI] Palette {set.SetId} from {set.Source}: {set.Profiles.Count} profiles, " +
+                      $"{missing.Count} clip(s) to fetch. {set.Notes}");
+
+            if (missing.Count > 0)
+                _haptics.Client.Send(new HapticWire.ClipsNeeded { set_id = set.SetId, profiles = missing.ToArray() });
+
+            _session.UpdateHapticSource(DescribeSource());
+            _session.SetHapticsReady(DescribeSource());
+        }
+
+        void OnClipReceived(string setId, string profileId, string source, byte[] wav)
+        {
+            if (_haptics.Library.ReceiveWav(setId, profileId, source, wav))
+                Debug.Log($"[HapticAI] Clip {profileId} ready ({source}); {_haptics.Library.ClipCount}/{_haptics.Library.ProfileCount}.");
+        }
+
+        /// <summary>The on-device palette: identical roles, template prompts, mock synth. Never blocks.</summary>
+        void AdoptOfflinePalette()
+        {
+            if (_offlinePaletteAdopted || _serverPaletteAdopted) return;
+            _offlinePaletteAdopted = true;
+
+            string surfaces = string.Join(", ", _fireManager.RoomSurfaceLabels);
+            var set = OfflineProfileSynth.BuildSet(surfaces);
+            _haptics.Library.AdoptManifest(set);
+            _session.SetHapticsReady(DescribeSource());
+            _ = _haptics.Offline.SynthesiseMissingAsync(_haptics.Library, _cts.Token);
         }
 
         string DescribeSource()
         {
             if (!_haptics.UsingBackend) return _haptics.SourceDescription;
-            return $"{_haptics.SourceDescription} - {_backendStatus ?? "unknown"}";
-        }
-
-        /// <summary>
-        /// Canonical events pre-generated so runtime hits play instantly.
-        ///
-        /// Every runtime fire event carries a distance cue, so warm entries that omit it can never
-        /// match one; 3 m lands in the "across the room" bucket, which is what most events hit.
-        ///
-        /// The spray entries cover every bucket the trigger can actually reach. The old set warmed
-        /// 0.3 / 0.7 / 1.0, which at four buckets is 1, 2 and 4 — leaving buckets 0 and 3 cold, so a
-        /// light or three-quarter squeeze fell through to a procedural stand-in every time.
-        /// </summary>
-        IEnumerable<HapticEvent> WarmSet()
-        {
-            var events = new List<HapticEvent>
-            {
-                new HapticEvent(HapticEventType.Ignite).WithNumber("intensity", 1f)
-                    .WithNumber("distance", 3f).WithTag("surface", "TABLE"),
-                new HapticEvent(HapticEventType.Spread).WithNumber("intensity", 0.8f)
-                    .WithNumber("distance", 3f).WithTag("surface", "WALL_FACE"),
-                new HapticEvent(HapticEventType.Spread).WithNumber("intensity", 0.8f)
-                    .WithNumber("distance", 3f).WithTag("surface", "FLOOR"),
-                new HapticEvent(HapticEventType.Extinguish).WithNumber("intensity", 0.7f)
-                    .WithNumber("distance", 3f),
-                HapticEvent.Custom(FireHapticRelay.CompleteEventName).WithNumber("intensity", 1f),
-            };
-
-            int buckets = Mathf.Max(1, config.cacheBuckets);
-            for (int b = 0; b <= buckets; b++)
-            {
-                // Midpoint of each bucket, and exactly 1.0 for the top one (a fully pulled trigger
-                // is its own bucket because (int)(1.0 * buckets) == buckets).
-                float depth = b < buckets ? (b + 0.5f) / buckets : 1f;
-                events.Add(new HapticEvent(HapticEventType.SprayTick).WithNumber("triggerDepth", depth));
-            }
-            return events;
+            var client = _haptics.Client;
+            string socket = client == null ? "no socket"
+                : client.State == HapticSessionClient.Status.Connected
+                    ? $"socket up, gemini {client.ServerTransport}"
+                    : $"socket {client.State.ToString().ToLowerInvariant()}";
+            return $"{_haptics.SourceDescription} - {_backendStatus}, {socket}";
         }
 
         // --- World --------------------------------------------------------------------------

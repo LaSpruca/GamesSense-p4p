@@ -32,6 +32,12 @@ namespace FireSim
 
         public bool IsSpraying => _spraying;
 
+        /// <summary>
+        /// The nozzle: this component's own transform, whose +Z is the spray direction. Exposed so
+        /// <see cref="SurfaceFireManager"/> can grade aim and sweep without knowing the hierarchy.
+        /// </summary>
+        public Transform Nozzle => transform;
+
         /// <summary>Raised on the frame spraying starts, with the trigger value (0-1).</summary>
         public event System.Action<float> SprayStarted;
         /// <summary>Raised on the frame spraying stops.</summary>

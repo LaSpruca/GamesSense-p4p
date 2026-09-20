@@ -73,14 +73,26 @@ namespace HapticAI.Scene
             _right.TopUp(now);
         }
 
-        /// <summary>Play a discrete clip in full, interrupting whatever is currently playing.</summary>
-        public void PlayCue(HapticClipData data, HapticHand hand = HapticHand.Right)
+        /// <summary>
+        /// Play a discrete clip in full, interrupting whatever is currently playing.
+        /// <paramref name="gain"/> scales the amplitudes (1 = as rendered).
+        /// </summary>
+        public void PlayCue(HapticClipData data, float gain = 1f, HapticHand hand = HapticHand.Right)
         {
             if (data == null || data.Amplitudes.Length == 0) return;
             if (!CheckAvailable()) return;
 
+            byte[] samples = data.Amplitudes;
+            if (gain < 0.999f || gain > 1.001f)
+            {
+                // OVRHapticsClip keeps the array by reference, so scale into a fresh buffer.
+                samples = new byte[data.Amplitudes.Length];
+                for (int i = 0; i < samples.Length; i++)
+                    samples[i] = Scale(data.Amplitudes[i], gain);
+            }
+
             var output = OutputFor(hand);
-            output.Channel.Preempt(new OVRHapticsClip(data.Amplitudes, data.Amplitudes.Length));
+            output.Channel.Preempt(new OVRHapticsClip(samples, samples.Length));
             // Hold the sustained loop off until the cue has had time to finish.
             output.BusyUntil = Time.realtimeSinceStartup + data.DurationSeconds;
         }
@@ -88,13 +100,20 @@ namespace HapticAI.Scene
         /// <summary>
         /// Start (or swap) the continuously looping clip for a hand. Swapping mid-spray keeps the
         /// current read position, so a spray clip upgrading from procedural fallback to the real
-        /// generated one does not click.
+        /// generated one does not click. <paramref name="gain"/> is applied per slice, so a gain
+        /// change needs no re-render either.
         /// </summary>
-        public void SetSustained(HapticClipData data, HapticHand hand = HapticHand.Right)
+        public void SetSustained(HapticClipData data, float gain = 1f, HapticHand hand = HapticHand.Right)
         {
             if (data == null || data.Amplitudes.Length == 0) return;
             if (!CheckAvailable()) return;
-            OutputFor(hand).SetLoop(data.Amplitudes);
+            OutputFor(hand).SetLoop(data.Amplitudes, gain);
+        }
+
+        static byte Scale(byte amplitude, float gain)
+        {
+            float v = amplitude * gain;
+            return (byte)(v >= 255f ? 255 : v <= 0f ? 0 : (int)(v + 0.5f));
         }
 
         /// <summary>
@@ -157,6 +176,7 @@ namespace HapticAI.Scene
         {
             readonly System.Func<OVRHaptics.OVRHapticsChannel> _channel;
             byte[] _loop;
+            float _gain = 1f;
             int _read;
 
             public Output(System.Func<OVRHaptics.OVRHapticsChannel> channel) => _channel = channel;
@@ -164,9 +184,10 @@ namespace HapticAI.Scene
             public OVRHaptics.OVRHapticsChannel Channel => _channel();
             public float BusyUntil { get; set; }
 
-            public void SetLoop(byte[] samples)
+            public void SetLoop(byte[] samples, float gain)
             {
                 _loop = samples;
+                _gain = gain < 0f ? 0f : gain;
                 if (_read >= samples.Length) _read = 0;
             }
 
@@ -194,7 +215,7 @@ namespace HapticAI.Scene
                     var buffer = new byte[sliceSamples];
                     for (int s = 0; s < sliceSamples; s++)
                     {
-                        buffer[s] = _loop[_read];
+                        buffer[s] = Scale(_loop[_read], _gain);
                         _read = (_read + 1) % _loop.Length;
                     }
                     Channel.Queue(new OVRHapticsClip(buffer, sliceSamples));

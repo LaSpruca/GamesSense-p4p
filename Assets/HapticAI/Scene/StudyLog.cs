@@ -29,23 +29,30 @@ namespace HapticAI.Scene
     {
         public const string FileName = "study-runs.csv";
 
-        const string Header = "timestamp,participant,condition,duration_s,fires_extinguished," +
-                              "peak_burning,clips_generated,clips_fallback,haptic_source";
+        const string Header = "timestamp,participant,condition,stage,stage_name,duration_s," +
+                              "fires_extinguished,reignitions,peak_burning,base_hit_fraction," +
+                              "clips_generated,clips_fallback,gemini_selections,haptic_source";
 
         public static string FilePath => Path.Combine(Application.persistentDataPath, FileName);
 
-        public static void AppendRun(StudySettings settings, HapticsMode mode, float runSeconds,
-            SurfaceFireManager fire, FireHapticRelay relay, string hapticSource)
+        /// <summary>One line per completed STAGE, so a participant who stops at stage 3 still leaves data.</summary>
+        public static void AppendStage(StudySettings settings, HapticsMode mode, TrainingStage stage,
+            float runSeconds, SurfaceFireManager fire, FireHapticRelay relay, string hapticSource)
         {
             var line = new StringBuilder();
             Append(line, DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture));
             Append(line, settings != null ? settings.ParticipantId : "unknown");
             Append(line, mode == HapticsMode.Ai ? "ai" : "static");
+            Append(line, stage != null ? stage.Index.ToString() : "");
+            Append(line, stage != null ? stage.Name : "");
             Append(line, runSeconds.ToString("0.0", CultureInfo.InvariantCulture));
             Append(line, fire != null ? fire.TotalExtinguished.ToString() : "");
+            Append(line, fire != null ? fire.TotalReignited.ToString() : "");
             Append(line, fire != null ? fire.PeakBurning.ToString() : "");
+            Append(line, fire != null ? fire.BaseHitFraction.ToString("0.00", CultureInfo.InvariantCulture) : "");
             Append(line, relay != null ? relay.GeneratedCount.ToString() : "");
             Append(line, relay != null ? relay.FallbackCount.ToString() : "");
+            Append(line, relay != null ? relay.GeminiSelections.ToString() : "");
             Append(line, hapticSource, last: true);
 
             Write(line.ToString());

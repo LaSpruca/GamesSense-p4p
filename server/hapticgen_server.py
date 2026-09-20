@@ -6,8 +6,15 @@ on the Quest headset. Run this on a machine with an NVIDIA GPU; the headset call
 
 Endpoints:
 
-    POST /haptics   -- what the headset calls now. The whole prompt-generation process
-        (context building + the Gemini chain) runs HERE, then feeds HaptiGen.
+    WS   /ws        -- what the headset uses now. One persistent socket per headset session:
+        the headset sends a scene snapshot, the server plans a palette of haptic profiles with
+        Gemini (over the Live API), synthesises each with HaptiGen and streams the clips down;
+        then the headset streams spray readings and receives profile selections. Protocol in
+        ws_session.py. Try it with ws_test.py.
+
+    POST /haptics   -- the previous request-per-event path, kept for e2e_test.py and any older
+        client. The whole prompt-generation process (context building + the Gemini chain) runs
+        HERE, then feeds HaptiGen.
         body: {"event": str, "custom_name": str?, "hand": str,
                "numbers": {str: float}, "tags": {str: str},
                "duration_s": float, "seed": int}
@@ -36,20 +43,24 @@ Setup (see README.md for detail):
 """
 
 import argparse
+import asyncio
 import io
 import threading
 import wave
 from typing import Dict, Optional
 
 import numpy as np
-from fastapi import FastAPI, Response
+from fastapi import FastAPI, Response, WebSocket
 from pydantic import BaseModel, Field
 
 # The prompt-generation process that used to live on the headset now runs here.
 from haptic_prompt import build_prompt, gemini_available
+import clip_cache
 import device as device_mod
+import haptic_profiles
 import haptic_quality
 import npu_decode
+from ws_session import HeadsetSession
 
 # torch + HapticGen/AudioCraft are only needed to run the real model. They are optional so the
 # server can still serve the numpy-only placeholder synth — enough to smoke-test the /haptics
@@ -104,6 +115,10 @@ _GEN_PARAMS = dict(use_sampling=True, top_k=250, top_p=0.0, temperature=1.0, cfg
 # --candidates controls how many clips we generate before picking one.
 _MIN_PEAK_AMPLITUDE = haptic_quality.MIN_PEAK_AMPLITUDE
 _MIN_995TH_AMPLITUDE = haptic_quality.MIN_995TH_AMPLITUDE
+# Candidates per profile clip on the WebSocket path. Drones hit 1 in 3 scenes at 1 candidate
+# (see README), and a drone in a LOOPING spray profile masks every other haptic for the whole
+# session, so the profile path defaults higher than /haptics does. --candidates overrides.
+_ws_candidates = 3
 
 
 def load_model(weights_path: str, choice=None):
@@ -208,6 +223,29 @@ def _synthesize(prompt: str, duration_s: float, seed: int, candidates: int = 1):
     return samples, sr, info
 
 
+async def synth_cached(prompt: str, duration_s: float, seed: int, candidates: int):
+    """
+    The WebSocket path's synthesiser: (wav bytes, info). Runs the blocking generation off the
+    event loop so the socket stays responsive to spray readings while HaptiGen works, and serves
+    repeats from the disk cache - a re-planned scene yields the same prompts, so the second session
+    in a room pays no synthesis at all.
+    """
+    backend = "placeholder" if _model is None else f"hapticgen:{_device.kind}"
+    key = clip_cache.key_for(prompt, duration_s, seed, candidates, backend)
+    cached = clip_cache.get(key)
+    if cached is not None:
+        return cached, {"backend": backend, "cached": True}
+    samples, sr, info = await asyncio.to_thread(_synthesize, prompt, duration_s, seed, candidates)
+    wav = _to_wav_bytes(samples, sr)
+    # A drone or a silent clip is not worth remembering: let the next session re-roll it.
+    if not info.get("degenerate") and not info.get("silent"):
+        clip_cache.put(key, wav)
+    return wav, info
+
+
+synth_cached.model_loaded = lambda: _model is not None   # read by HeadsetSession.welcome
+
+
 def _header_safe(text: str, limit: int = 400) -> str:
     """HTTP header values must be single-line ASCII; sanitise the prompt for X-Haptic-Prompt."""
     one_line = " ".join((text or "").split())
@@ -239,7 +277,16 @@ def health():
         },
         "hardware": device_mod.probe(),
         "gemini": gemini_available(),
+        "gemini_live_model": haptic_profiles.LIVE_MODEL,
+        "ws": "/ws",
+        "roles": [r.name for r in haptic_profiles.ROLES],
     }
+
+
+@app.websocket("/ws")
+async def headset_socket(ws: WebSocket):
+    """One headset session: scene -> profiles + clips, then readings -> selections."""
+    await HeadsetSession(ws, synth_cached, candidates=_ws_candidates).run()
 
 
 @app.post("/generate")
@@ -272,7 +319,10 @@ if __name__ == "__main__":
                         help="Accelerator to use. auto = cuda > xpu > npu > cpu.")
     parser.add_argument("--list-devices", action="store_true",
                         help="Print detected accelerators and exit.")
+    parser.add_argument("--candidates", type=int, default=_ws_candidates,
+                        help="Clips generated per profile on the WebSocket path; the best is kept.")
     args = parser.parse_args()
+    _ws_candidates = max(1, args.candidates)
 
     if args.list_devices:
         for key, value in device_mod.probe().items():

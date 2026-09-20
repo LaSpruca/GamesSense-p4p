@@ -3,18 +3,16 @@ using UnityEngine;
 namespace HapticAI.Config
 {
     /// <summary>
-    /// Central, inspector-editable configuration for the AI haptics pipeline. Since the prompting
-    /// move, the LLM prompt chain and the Gemini API key live on the backend server — not here.
-    /// This asset now configures only the on-device pieces: the offline fallback synth, the cache,
-    /// playback, and how a backend request behaves. The backend URL itself is a secret, kept out of
-    /// source control in <see cref="HapticSecrets"/>.
+    /// Central, inspector-editable configuration for the AI haptics pipeline. The LLM planning, the
+    /// Gemini API key and the profile prompts all live on the backend server — not here. This asset
+    /// configures only the on-device pieces: how waveforms are rendered to the controller, the
+    /// offline fallback synth, the profile store, and how the session socket behaves. The backend
+    /// URL itself is a secret, kept out of source control in <see cref="HapticSecrets"/>.
     /// </summary>
     [CreateAssetMenu(fileName = "HapticAIConfig", menuName = "HapticAI/Config")]
     public sealed class HapticAIConfig : ScriptableObject
     {
-        [Header("Generation")]
-        [Tooltip("Requested clip length (seconds) for generated haptics.")]
-        public float clipDurationSeconds = 1.0f;
+        [Header("Rendering")]
         [Tooltip("Gain applied when converting the waveform to controller amplitudes.")]
         public float amplitudeGain = 1.4f;
         [Tooltip("How strongly the source waveform's own roughness is re-imposed on the amplitude " +
@@ -29,19 +27,23 @@ namespace HapticAI.Config
         [Tooltip("In the Editor only, fall back to http://localhost:8080 when no URL is configured, " +
                  "so a local server is actually used instead of silently running the mock synth.")]
         public bool useEditorLocalhostFallback = true;
-        [Tooltip("HTTP timeout (seconds) for a backend request before falling back to on-device synthesis.")]
-        public int requestTimeoutSeconds = 30;
+        [Tooltip("Seconds to wait for the session socket to connect. If it has not connected by " +
+                 "then the on-device palette is used so the briefing is never held up; the socket " +
+                 "keeps retrying and the server palette takes over when it arrives.")]
+        public int connectTimeoutSeconds = 8;
+        [Tooltip("How often (per second) the spray reading is streamed to the server while the " +
+                 "trigger is held. Gemini is asked at most about once a second regardless.")]
+        public float stateSendHz = 8f;
 
         [Header("On-device offline synth (no server / fallback)")]
         public int mockSampleRate = 8000;
-        [Tooltip("Fake network latency to exercise the hybrid fallback path in-editor.")]
+        [Tooltip("Fake synthesis latency to exercise the fallback-then-upgrade path in-editor.")]
         public int mockLatencyMs = 0;
 
-        [Header("Cache")]
-        [Tooltip("Bucket granularity for numeric cues when forming cache keys (higher = more variety).")]
-        public int cacheBuckets = 4;
-        [Tooltip("Persist generated clips to disk so later sessions start instantly instead of " +
-                 "re-running the backend (17-34s per clip). Disable to force regeneration.")]
+        [Header("Profile store")]
+        [Tooltip("Persist each planned palette and its clips to disk so a later session in the same " +
+                 "room starts instantly instead of re-synthesising (~30 s per clip on the server). " +
+                 "Disable to force regeneration.")]
         public bool persistClipCache = true;
 
         [Header("Playback")]

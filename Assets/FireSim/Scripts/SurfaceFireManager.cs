@@ -6,20 +6,68 @@ using Meta.XR.MRUtilityKit;
 namespace FireSim
 {
     /// <summary>
+    /// Per-frame picture of what the spray is doing, for the haptics pipeline to stream to its
+    /// server. Everything here is derived from foam hits the patches report and the nozzle's
+    /// motion; nothing is sampled from the particle system directly.
+    /// </summary>
+    public struct SprayTelemetry
+    {
+        /// <summary>From the sprayer: trigger held past its threshold.</summary>
+        public bool Spraying;
+        /// <summary>From the sprayer: trigger pull 0..1 (0 when not spraying).</summary>
+        public float Trigger;
+        /// <summary>Foam particles/second currently landing on burning OR smouldering patches (smoothed over ~0.25 s).</summary>
+        public float HitRate;
+        /// <summary>Mean quality of those hits, 0..1 (1 = base), smoothed; 0 when none.</summary>
+        public float HitQuality;
+        /// <summary>Most recent hits were on a smouldering patch.</summary>
+        public bool Soaking;
+        /// <summary>
+        /// Nozzle lateral speed > 0.35 m/s AND HitRate > 15 AND (Coverage of the targeted spot
+        /// >= 0.66 when the stage has more than one sweep sector).
+        /// </summary>
+        public bool Sweeping;
+        /// <summary>Nozzle lateral speed, m/s (component of nozzle velocity perpendicular to its forward axis), smoothed.</summary>
+        public float SweepSpeed;
+        /// <summary>Coverage of the spot most recently hit (0..1).</summary>
+        public float Coverage;
+        /// <summary>Distance from nozzle to nearest burning/smouldering spot; 99 if none.</summary>
+        public float NearestFireMetres;
+        /// <summary>Angle between nozzle forward and the direction to the nearest burning/smouldering spot; 0 if none.</summary>
+        public float AimErrorDegrees;
+        public int FiresBurning;
+        public int FiresSmouldering;
+        public int StageIndex;
+    }
+
+    /// <summary>
     /// Owns the fire in the scene. MRUK hands it the room via <see cref="OnSceneReady"/>; the
-    /// session then calls <see cref="Begin"/> to light the first fire, which spreads to nearby
-    /// points on detected surfaces on a timer. Crucially it NEVER ignites a fresh, independent
-    /// fire: every new patch grows out of an existing burning patch, so once the user extinguishes
-    /// every patch the run is over and <see cref="AllExtinguished"/> fires.
+    /// session then calls <see cref="Begin(TrainingStage)"/> with the stage to run, which lights the
+    /// stage's initial fire(s) and, if the stage allows it, spreads to nearby points on detected
+    /// surfaces on a timer. Crucially it NEVER ignites a fresh, independent fire after that: every
+    /// new patch grows out of an existing burning patch, so once the user has put out every patch
+    /// (and none is left smouldering) the run is over and <see cref="AllExtinguished"/> fires.
     ///
     /// Ignition is deliberately NOT automatic on room load. The room can take several seconds to
     /// arrive and the haptics cache several more, and a fire that starts during that window burns
     /// unattended while the user is still reading the briefing. The session decides when to start.
+    ///
+    /// Everything that makes a stage easier or harder (spread, aim tolerance, sweep sectors,
+    /// re-ignition, recovery) lives on the <see cref="TrainingStage"/>, not in the inspector, so
+    /// the five stages are the single source of truth for difficulty.
     /// </summary>
     public class SurfaceFireManager : MonoBehaviour
     {
+        /// <summary>Foam hits at or above this quality count as "base" hits for scoring.</summary>
+        const float BaseHitQuality = 0.6f;
+        /// <summary>Time constant for the exponentially smoothed telemetry rates.</summary>
+        const float TelemetrySmoothing = 0.25f;
+        /// <summary>Minimum separation between the stage's initial fires.</summary>
+        const float InitialFireSpacing = 0.6f;
+        const float NoFireDistance = 99f;
+
         [Header("Fire patch")]
-        [Tooltip("Visual/collider radius of each burning patch, in metres.")]
+        [Tooltip("Visual radius of each burning patch, in metres. The stage scales the collider on top of this.")]
         public float spotRadius = 0.14f;
         [Tooltip("How far the flame column rises off the surface. Foam damage is graded over this " +
                  "height, so it is also the size of the 'aim at the base' target.")]
@@ -28,25 +76,8 @@ namespace FireSim
         [Tooltip("Health removed by one foam particle striking the BASE of the flames. A well-aimed " +
                  "spray lands 100-180 particles/s on a patch, so this sets the kill time directly.")]
         public float foamDamagePerParticle = 0.45f;
-        [Tooltip("Damage multiplier for foam hitting the top of the flames instead of the base.")]
-        [Range(0f, 1f)] public float topOfFlameDamageScale = 0.15f;
 
-        [Header("Recovery")]
-        [Tooltip("Seconds without foam before a knocked-down patch starts climbing back.")]
-        public float recoveryDelay = 1.5f;
-        [Tooltip("Health per second regained once recovery starts. Must stay well below the damage " +
-                 "rate of an accurate spray, or a patch becomes unkillable.")]
-        public float recoveryRate = 14f;
-
-        [Header("Spreading")]
-        [Tooltip("Seconds of grace after ignition before fire can spread at all.")]
-        public float firstSpreadDelay = 4f;
-        [Tooltip("Seconds between spread attempts.")]
-        public float spreadInterval = 1.75f;
-        [Tooltip("Chance (0-1) that a given eligible patch spreads on each tick.")]
-        [Range(0f, 1f)] public float spreadChance = 0.55f;
-        [Tooltip("Hard cap on new patches per tick, so a large fire cannot snowball out of reach.")]
-        public int maxSpreadsPerTick = 2;
+        [Header("Spreading (geometry - timing and chance come from the stage)")]
         [Tooltip("A patch below this health fraction is too weak to spread. Knocking a patch down " +
                  "therefore slows the fire even before it goes out.")]
         [Range(0f, 1f)] public float spreadHealthThreshold = 0.5f;
@@ -57,8 +88,6 @@ namespace FireSim
         public float surfaceSnapDistance = 0.25f;
         [Tooltip("Minimum spacing between patches so they don't stack up.")]
         public float minSpotSpacing = 0.28f;
-        [Tooltip("Upper bound on simultaneous burning patches.")]
-        public int maxSpots = 24;
 
         [Header("What can burn")]
         [Tooltip("Surfaces fire is allowed to live on. The initial fire prefers tables/storage, then the floor.")]
@@ -69,31 +98,97 @@ namespace FireSim
 
         readonly List<FireSpot> _spots = new List<FireSpot>();
         readonly List<MRUKAnchor> _flammableAnchors = new List<MRUKAnchor>();
+        readonly List<string> _roomSurfaceLabels = new List<string>();
         MRUKRoom _room;
         Transform _fireRoot;
         Coroutine _spreadLoop;
 
-        public int BurningCount => _spots.Count;
+        // Telemetry inputs, accumulated between LateUpdates.
+        FoamSprayer _sprayer;
+        float _trigger;
+        int _frameHits;
+        float _frameQualitySum;
+        FireSpot _lastHitSpot;
+        bool _lastHitSmouldering;
+        float _hitRate;
+        float _hitQuality;
+        bool _soaking;
+        float _sweepSpeed;
+        Vector3 _prevNozzlePos;
+        bool _havePrevNozzlePos;
+
+        /// <summary>The stage the current (or most recent) run was started with. Null before the first Begin.</summary>
+        public TrainingStage Stage { get; private set; }
+
+        /// <summary>Patches with flames up right now.</summary>
+        public int BurningCount
+        {
+            get
+            {
+                int n = 0;
+                for (int i = 0; i < _spots.Count; i++)
+                    if (_spots[i] != null && _spots[i].IsBurning) n++;
+                return n;
+            }
+        }
+        /// <summary>Patches knocked down but not yet out - they can still flare back.</summary>
+        public int SmoulderingCount
+        {
+            get
+            {
+                int n = 0;
+                for (int i = 0; i < _spots.Count; i++)
+                    if (_spots[i] != null && _spots[i].IsSmouldering) n++;
+                return n;
+            }
+        }
         /// <summary>True once MRUK has handed over a room with at least one flammable surface.</summary>
         public bool RoomReady { get; private set; }
-        /// <summary>True between <see cref="Begin"/> and the last patch going out.</summary>
+        /// <summary>True between <see cref="Begin(TrainingStage)"/> and AllExtinguished/Abort.</summary>
         public bool RunActive { get; private set; }
-        /// <summary>Patches lit this run, including the first one.</summary>
+        /// <summary>Patches lit this run, including the initial one(s). Re-ignitions are not counted here.</summary>
         public int TotalIgnited { get; private set; }
-        /// <summary>Patches the user put out this run.</summary>
+        /// <summary>Flames-out events this run. A patch that re-ignites and is knocked down again counts twice.</summary>
         public int TotalExtinguished { get; private set; }
+        /// <summary>Smouldering patches that flared back this run - the "walked away too soon" score.</summary>
+        public int TotalReignited { get; private set; }
         /// <summary>The most patches burning at once this run - a rough "how close did it get" score.</summary>
         public int PeakBurning { get; private set; }
+        /// <summary>Foam particles that hit a burning (not smouldering) patch this run.</summary>
+        public int TotalFoamHits { get; private set; }
+        /// <summary>Of <see cref="TotalFoamHits"/>, those with hit quality >= 0.6, i.e. on or near the base.</summary>
+        public int BaseHits { get; private set; }
+        /// <summary>BaseHits / TotalFoamHits; 0 when nothing has hit yet.</summary>
+        public float BaseHitFraction => TotalFoamHits > 0 ? (float)BaseHits / TotalFoamHits : 0f;
+
+        /// <summary>Distinct MRUK label names of the flammable anchors, e.g. "TABLE", "FLOOR".</summary>
+        public IReadOnlyList<string> RoomSurfaceLabels => _roomSurfaceLabels;
+        /// <summary>Total anchors MRUK found in the room (flammable or not).</summary>
+        public int RoomAnchorCount { get; private set; }
+        /// <summary>Size of the room's bounding box; Vector3.zero before the room is ready.</summary>
+        public Vector3 RoomSize { get; private set; }
+
+        /// <summary>Recomputed in LateUpdate every frame, whether or not a run is active.</summary>
+        public SprayTelemetry Telemetry { get; private set; }
 
         /// <summary>Raised once MRUK has produced a usable room. The session waits on this.</summary>
         public event System.Action RoomBecameReady;
-        /// <summary>Raised for the very first fire of a run.</summary>
+        /// <summary>Raised for each initial fire of a run (one per stage.InitialFires).</summary>
         public event System.Action<FireSpot> SpotIgnited;
         /// <summary>Raised each time fire spreads to a new patch.</summary>
         public event System.Action<FireSpot> SpotSpread;
-        /// <summary>Raised as a patch is extinguished.</summary>
+        /// <summary>Raised the moment a patch's flames go out (it may still smoulder afterwards).</summary>
         public event System.Action<FireSpot> SpotExtinguished;
-        /// <summary>Raised when the last burning patch goes out - i.e. the user has finished.</summary>
+        /// <summary>Raised when a knocked-down patch enters its smouldering state.</summary>
+        public event System.Action<FireSpot> SpotSmouldering;
+        /// <summary>Raised when a smouldering patch flares back into a burning one.</summary>
+        public event System.Action<FireSpot> SpotReignited;
+        /// <summary>Raised when a patch is out for good and about to be removed.</summary>
+        public event System.Action<FireSpot> SpotOut;
+        /// <summary>
+        /// Raised when no patch is burning OR smouldering - i.e. the stage is complete. Never fires
+        /// while an ember could still flare back.
+        /// </summary>
         public event System.Action AllExtinguished;
 
         void Awake()
@@ -114,15 +209,39 @@ namespace FireSim
             }
 
             CollectFlammableAnchors();
+            RoomSize = _room.GetRoomBounds().size;
             RoomReady = true;
             RoomBecameReady?.Invoke();
         }
 
         /// <summary>
-        /// Light the first fire and start the spread loop. Safe to call again after a run finishes;
-        /// that is what Restart does.
+        /// The sprayer whose nozzle and trigger feed <see cref="Telemetry"/>. The bootstrap calls
+        /// this once both objects exist; the manager does not go looking for a sprayer itself.
         /// </summary>
-        public bool Begin()
+        public void AttachSprayer(FoamSprayer sprayer)
+        {
+            if (_sprayer != null) _sprayer.Spraying -= OnSprayerSpraying;
+            _sprayer = sprayer;
+            _havePrevNozzlePos = false;
+            _sweepSpeed = 0f;
+            if (_sprayer != null) _sprayer.Spraying += OnSprayerSpraying;
+        }
+
+        void OnDestroy()
+        {
+            if (_sprayer != null) _sprayer.Spraying -= OnSprayerSpraying;
+        }
+
+        void OnSprayerSpraying(float trigger) => _trigger = trigger;
+
+        /// <summary>Convenience overload: runs the first stage. Prefer <see cref="Begin(TrainingStage)"/>.</summary>
+        public bool Begin() => Begin(TrainingStages.Get(1));
+
+        /// <summary>
+        /// Apply the stage, light its initial fire(s) and start the spread loop if the stage has
+        /// one. Safe to call again after a run finishes; that is what Restart / Next stage do.
+        /// </summary>
+        public bool Begin(TrainingStage stage)
         {
             if (!RoomReady)
             {
@@ -130,29 +249,58 @@ namespace FireSim
                 return false;
             }
             if (RunActive) return true;
+            if (stage == null)
+            {
+                Debug.LogWarning("[FireSim] Begin() called with no stage - using stage 1.");
+                stage = TrainingStages.Get(1);
+            }
 
             ClearAllSpots();
-            TotalIgnited = 0;
-            TotalExtinguished = 0;
-            PeakBurning = 0;
+            ResetRunState();
+            Stage = stage;
 
             if (!IgniteInitialFire())
             {
                 Debug.LogWarning("[FireSim] Could not find a flammable surface to ignite.");
                 return false;
             }
+            for (int i = 1; i < stage.InitialFires; i++)
+            {
+                if (!IgniteExtraFire())
+                    Debug.LogWarning($"[FireSim] Could not place initial fire {i + 1} of {stage.InitialFires}.");
+            }
 
             RunActive = true;
-            _spreadLoop = StartCoroutine(SpreadLoop());
+            if (stage.SpreadEnabled) _spreadLoop = StartCoroutine(SpreadLoop());
             return true;
         }
 
-        /// <summary>Stop the run and remove every burning patch without raising AllExtinguished.</summary>
+        /// <summary>Stop the run and remove every patch without raising AllExtinguished.</summary>
         public void Abort()
         {
             RunActive = false;
             if (_spreadLoop != null) { StopCoroutine(_spreadLoop); _spreadLoop = null; }
             ClearAllSpots();
+            _lastHitSpot = null;
+            _frameHits = 0;
+            _frameQualitySum = 0f;
+        }
+
+        void ResetRunState()
+        {
+            TotalIgnited = 0;
+            TotalExtinguished = 0;
+            TotalReignited = 0;
+            PeakBurning = 0;
+            TotalFoamHits = 0;
+            BaseHits = 0;
+            _frameHits = 0;
+            _frameQualitySum = 0f;
+            _lastHitSpot = null;
+            _lastHitSmouldering = false;
+            _hitRate = 0f;
+            _hitQuality = 0f;
+            _soaking = false;
         }
 
         void ClearAllSpots()
@@ -165,12 +313,18 @@ namespace FireSim
         void CollectFlammableAnchors()
         {
             _flammableAnchors.Clear();
+            _roomSurfaceLabels.Clear();
+            RoomAnchorCount = 0;
             foreach (var anchor in _room.Anchors)
             {
                 if (anchor == null) continue;
+                RoomAnchorCount++;
                 if (!anchor.HasAnyLabel(flammableLabels)) continue;
                 if (!anchor.PlaneRect.HasValue && !anchor.VolumeBounds.HasValue) continue;
                 _flammableAnchors.Add(anchor);
+
+                string label = anchor.Label.ToString();
+                if (!_roomSurfaceLabels.Contains(label)) _roomSurfaceLabels.Add(label);
             }
         }
 
@@ -202,29 +356,71 @@ namespace FireSim
             return false;
         }
 
+        /// <summary>
+        /// A second/third starting fire on any flammable surface, ideally well away from the ones
+        /// already lit so the user has to choose which to fight first. Falls back to whatever it
+        /// can find rather than silently running the stage with fewer fires than briefed.
+        /// </summary>
+        bool IgniteExtraFire()
+        {
+            const int attempts = 12;
+            bool haveFallback = false;
+            Vector3 fallbackPos = Vector3.zero, fallbackNormal = Vector3.up;
+
+            for (int i = 0; i < attempts; i++)
+            {
+                if (!_room.GenerateRandomPositionOnSurface(MRUK.SurfaceType.FACING_UP, spotRadius,
+                        new LabelFilter(flammableLabels), out var pos, out var normal))
+                    break;
+                if (!haveFallback) { haveFallback = true; fallbackPos = pos; fallbackNormal = normal; }
+                if (DistanceToNearestSpot(pos) < InitialFireSpacing) continue;
+
+                SpotIgnited?.Invoke(SpawnSpot(pos, normal, FindAnchorAt(pos)));
+                return true;
+            }
+
+            // No random candidate was far enough away; try anchor centres, then take anything.
+            foreach (var anchor in _flammableAnchors)
+            {
+                if (anchor == null) continue;
+                anchor.GetClosestSurfacePosition(anchor.GetAnchorCenter(), out var p, out var n);
+                if (DistanceToNearestSpot(p) < InitialFireSpacing) continue;
+                SpotIgnited?.Invoke(SpawnSpot(p, n, anchor));
+                return true;
+            }
+
+            if (haveFallback)
+            {
+                SpotIgnited?.Invoke(SpawnSpot(fallbackPos, fallbackNormal, FindAnchorAt(fallbackPos)));
+                return true;
+            }
+            return false;
+        }
+
         IEnumerator SpreadLoop()
         {
-            yield return new WaitForSeconds(firstSpreadDelay);
+            yield return new WaitForSeconds(Stage.FirstSpreadDelay);
 
-            var wait = new WaitForSeconds(spreadInterval);
+            var wait = new WaitForSeconds(Stage.SpreadInterval);
             while (RunActive)
             {
                 yield return wait;
-                if (_spots.Count == 0 || _spots.Count >= maxSpots) continue;
+                if (_spots.Count == 0 || _spots.Count >= Stage.MaxSpots) continue;
 
                 // Snapshot the count so we don't iterate over patches added by this same tick.
                 int existing = _spots.Count;
                 int spreadsThisTick = 0;
-                for (int i = 0; i < existing && _spots.Count < maxSpots; i++)
+                for (int i = 0; i < existing && _spots.Count < Stage.MaxSpots; i++)
                 {
-                    if (spreadsThisTick >= maxSpreadsPerTick) break;
+                    if (spreadsThisTick >= Stage.MaxSpreadsPerTick) break;
 
                     var spot = _spots[i];
+                    // Smouldering patches don't spread - only live flames throw off new fire.
                     if (spot == null || !spot.IsBurning) continue;
                     // A patch you have knocked down is too weak to throw off new fire. This is the
                     // main reason committing to one patch at a time beats spraying everything.
                     if (spot.HealthFraction < spreadHealthThreshold) continue;
-                    if (Random.value > spreadChance) continue;
+                    if (Random.value > Stage.SpreadChance) continue;
 
                     if (TrySpreadFrom(spot)) spreadsThisTick++;
                 }
@@ -248,7 +444,7 @@ namespace FireSim
             // Snap the candidate onto the nearest detected surface; reject if nothing is close.
             if (!FindNearestSurfacePoint(candidate, out var surfacePos, out var surfaceNormal, out var anchor))
                 return false;
-            if (IsTooCloseToExistingSpot(surfacePos)) return false;
+            if (DistanceToNearestSpot(surfacePos) < minSpotSpacing) return false;
 
             SpotSpread?.Invoke(SpawnSpot(surfacePos, surfaceNormal, anchor));
             return true;
@@ -282,14 +478,16 @@ namespace FireSim
             return anchor;
         }
 
-        bool IsTooCloseToExistingSpot(Vector3 point)
+        float DistanceToNearestSpot(Vector3 point)
         {
+            float best = float.MaxValue;
             foreach (var s in _spots)
             {
                 if (s == null) continue;
-                if (Vector3.Distance(s.Position, point) < minSpotSpacing) return true;
+                float d = Vector3.Distance(s.Position, point);
+                if (d < best) best = d;
             }
-            return false;
+            return best;
         }
 
         FireSpot SpawnSpot(Vector3 position, Vector3 normal, MRUKAnchor anchor)
@@ -303,28 +501,183 @@ namespace FireSim
                 FlameHeight = flameHeight,
                 Health = spotHealth,
                 FoamDamagePerParticle = foamDamagePerParticle,
-                TopOfFlameDamageScale = topOfFlameDamageScale,
-                RecoveryDelay = recoveryDelay,
-                RecoveryRate = recoveryRate,
+                TopOfFlameDamageScale = Stage.TopOfFlameDamageScale,
+                RecoveryDelay = Stage.RecoveryDelay,
+                RecoveryRate = Stage.RecoveryRate,
+                HitRadiusScale = Stage.HitRadiusScale,
+                BaseBandFraction = Stage.BaseBandFraction,
+                SweepSectors = Stage.SweepSectors,
+                ReigniteEnabled = Stage.ReigniteEnabled,
+                SoakSeconds = Stage.SoakSeconds,
+                ReigniteDelay = Stage.ReigniteDelay,
+                ReigniteChance = Stage.ReigniteChance,
+                ReigniteHealthFraction = Stage.ReigniteHealthFraction,
             });
             _spots.Add(spot);
             TotalIgnited++;
-            if (_spots.Count > PeakBurning) PeakBurning = _spots.Count;
+            TrackPeak();
             return spot;
         }
 
+        void TrackPeak()
+        {
+            int burning = BurningCount;
+            if (burning > PeakBurning) PeakBurning = burning;
+        }
+
+        // ---- Callbacks from FireSpot ------------------------------------------------------------
+
+        /// <summary>
+        /// Called by a patch every frame foam lands on it (from OnParticleCollision, which Unity
+        /// runs before LateUpdate). Accumulated here and folded into <see cref="Telemetry"/> once
+        /// per frame. Scoring counters only count hits on burning patches: foam on embers is
+        /// soaking, not aim.
+        /// </summary>
+        public void ReportFoamHit(FireSpot spot, int particles, float meanQuality, bool smouldering)
+        {
+            if (particles <= 0) return;
+            _frameHits += particles;
+            _frameQualitySum += meanQuality * particles;
+            _lastHitSpot = spot;
+            _lastHitSmouldering = smouldering;
+
+            if (smouldering) return;
+            TotalFoamHits += particles;
+            if (meanQuality >= BaseHitQuality) BaseHits += particles;
+        }
+
+        /// <summary>The flames-out moment. The patch may go on to smoulder; it is not removed here.</summary>
         public void OnSpotExtinguished(FireSpot spot)
         {
-            SpotExtinguished?.Invoke(spot);
-            _spots.Remove(spot);
             TotalExtinguished++;
+            SpotExtinguished?.Invoke(spot);
+        }
 
-            if (_spots.Count != 0 || !RunActive) return;
+        public void OnSpotSmouldering(FireSpot spot)
+        {
+            SpotSmouldering?.Invoke(spot);
+        }
+
+        public void OnSpotReignited(FireSpot spot)
+        {
+            TotalReignited++;
+            TrackPeak();
+            SpotReignited?.Invoke(spot);
+        }
+
+        /// <summary>The patch is gone for good. This is the only place a run can complete.</summary>
+        public void OnSpotOut(FireSpot spot)
+        {
+            SpotOut?.Invoke(spot);
+            _spots.Remove(spot);
+            if (_lastHitSpot == spot) _lastHitSpot = null;
+
+            if (!RunActive) return;
+            for (int i = 0; i < _spots.Count; i++)
+            {
+                var s = _spots[i];
+                if (s != null && (s.IsBurning || s.IsSmouldering)) return;
+            }
 
             RunActive = false;
             if (_spreadLoop != null) { StopCoroutine(_spreadLoop); _spreadLoop = null; }
-            Debug.Log($"[FireSim] All fire extinguished after {TotalExtinguished} patch(es).");
+            Debug.Log($"[FireSim] Stage {(Stage != null ? Stage.Index : 0)} complete: " +
+                      $"{TotalExtinguished} knock-down(s), {TotalReignited} re-ignition(s).");
             AllExtinguished?.Invoke();
+        }
+
+        // ---- Telemetry ---------------------------------------------------------------------------
+
+        /// <summary>
+        /// Folds this frame's foam hits and nozzle motion into the smoothed telemetry. Runs after
+        /// every OnParticleCollision for the frame, so the per-frame accumulators are complete.
+        /// </summary>
+        void LateUpdate()
+        {
+            float dt = Time.deltaTime;
+            if (dt <= 0f) return;
+            // Exponential smoothing with a fixed time constant, so the result is frame-rate independent.
+            float alpha = 1f - Mathf.Exp(-dt / TelemetrySmoothing);
+
+            float instantRate = _frameHits / dt;
+            _hitRate = Mathf.Lerp(_hitRate, instantRate, alpha);
+            if (_frameHits > 0)
+            {
+                _hitQuality = Mathf.Lerp(_hitQuality, _frameQualitySum / _frameHits, alpha);
+                _soaking = _lastHitSmouldering;
+            }
+            else
+            {
+                _hitQuality = Mathf.Lerp(_hitQuality, 0f, alpha);
+                if (_hitRate < 1f) { _hitRate = 0f; _hitQuality = 0f; _soaking = false; }
+            }
+            _frameHits = 0;
+            _frameQualitySum = 0f;
+
+            bool spraying = _sprayer != null && _sprayer.IsSpraying;
+            if (!spraying) _trigger = 0f;
+
+            float nearest = NoFireDistance;
+            float aimError = 0f;
+            if (_sprayer != null)
+            {
+                Transform nozzle = _sprayer.Nozzle;
+                Vector3 nozzlePos = nozzle.position;
+                if (_havePrevNozzlePos)
+                {
+                    Vector3 velocity = (nozzlePos - _prevNozzlePos) / dt;
+                    Vector3 forward = nozzle.forward;
+                    Vector3 lateral = velocity - forward * Vector3.Dot(velocity, forward);
+                    _sweepSpeed = Mathf.Lerp(_sweepSpeed, lateral.magnitude, alpha);
+                }
+                _prevNozzlePos = nozzlePos;
+                _havePrevNozzlePos = true;
+
+                FireSpot target = NearestLiveSpot(nozzlePos, out nearest);
+                if (target != null)
+                    aimError = Vector3.Angle(nozzle.forward, target.Position - nozzlePos);
+                else
+                    nearest = NoFireDistance;
+            }
+
+            float coverage = 0f;
+            if (_lastHitSpot != null && (_lastHitSpot.IsBurning || _lastHitSpot.IsSmouldering))
+                coverage = _lastHitSpot.Coverage;
+
+            bool needsCoverage = Stage != null && Stage.SweepSectors > 1;
+            bool sweeping = _sweepSpeed > 0.35f && _hitRate > 15f && (!needsCoverage || coverage >= 0.66f);
+
+            Telemetry = new SprayTelemetry
+            {
+                Spraying = spraying,
+                Trigger = _trigger,
+                HitRate = _hitRate,
+                HitQuality = _hitQuality,
+                Soaking = _soaking,
+                Sweeping = sweeping,
+                SweepSpeed = _sweepSpeed,
+                Coverage = coverage,
+                NearestFireMetres = nearest,
+                AimErrorDegrees = aimError,
+                FiresBurning = BurningCount,
+                FiresSmouldering = SmoulderingCount,
+                StageIndex = Stage != null ? Stage.Index : 0,
+            };
+        }
+
+        /// <summary>Nearest patch that is still burning or smouldering, or null with distance 99.</summary>
+        FireSpot NearestLiveSpot(Vector3 from, out float distance)
+        {
+            FireSpot best = null;
+            distance = NoFireDistance;
+            for (int i = 0; i < _spots.Count; i++)
+            {
+                var s = _spots[i];
+                if (s == null || (!s.IsBurning && !s.IsSmouldering)) continue;
+                float d = Vector3.Distance(from, s.Position);
+                if (d < distance) { distance = d; best = s; }
+            }
+            return best;
         }
     }
 }

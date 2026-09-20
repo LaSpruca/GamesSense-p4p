@@ -37,6 +37,7 @@ namespace HapticAI.Config
         const string KeyUseServer = Prefix + "useServer";
         const string KeyServerHost = Prefix + "serverHost";
         const string KeyServerPort = Prefix + "serverPort";
+        const string KeyShowDiagnostics = Prefix + "showDiagnostics";
 
         /// <summary>Participant currently in the headset. Rendered as "P07" and used in the run log.</summary>
         public int participantNumber = MinParticipant;
@@ -58,6 +59,15 @@ namespace HapticAI.Config
         public string serverHost = "";
 
         public int serverPort = DefaultPort;
+
+        /// <summary>
+        /// Show the technical lines - haptics source, palette progress, clip counts - on the
+        /// briefing and result screens. They are there for whoever is running the study; a
+        /// participant reading "12 of 18 clips ready, stand-ins for the rest" learns nothing
+        /// except that something might be broken. On by default, so a headset that is never
+        /// touched keeps showing what it always showed.
+        /// </summary>
+        public bool showDiagnostics = true;
 
         /// <summary>
         /// False until somebody has actually been through the setup screen and saved. Until then
@@ -112,6 +122,7 @@ namespace HapticAI.Config
                 useServer = PlayerPrefs.GetInt(KeyUseServer, 1) == 1,
                 serverHost = PlayerPrefs.GetString(KeyServerHost, ""),
                 serverPort = PlayerPrefs.GetInt(KeyServerPort, DefaultPort),
+                showDiagnostics = PlayerPrefs.GetInt(KeyShowDiagnostics, 1) == 1,
             };
             s.Clamp();
             return s;
@@ -137,6 +148,7 @@ namespace HapticAI.Config
             PlayerPrefs.SetInt(KeyUseServer, useServer ? 1 : 0);
             PlayerPrefs.SetString(KeyServerHost, serverHost ?? string.Empty);
             PlayerPrefs.SetInt(KeyServerPort, serverPort);
+            PlayerPrefs.SetInt(KeyShowDiagnostics, showDiagnostics ? 1 : 0);
             PlayerPrefs.Save();
         }
 
@@ -146,7 +158,7 @@ namespace HapticAI.Config
             string[] keys =
             {
                 KeyConfigured, KeyParticipant, KeyCondition, KeyLockCondition,
-                KeyUseServer, KeyServerHost, KeyServerPort,
+                KeyUseServer, KeyServerHost, KeyServerPort, KeyShowDiagnostics,
             };
             foreach (var key in keys) PlayerPrefs.DeleteKey(key);
             PlayerPrefs.Save();

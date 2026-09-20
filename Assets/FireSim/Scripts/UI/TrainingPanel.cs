@@ -282,7 +282,9 @@ namespace FireSim.UI
                         Vector3.Distance(_head.position, transform.position) > distance + recentreDistance;
             if (lost) Recentre(snap: false);
 
-            float k = 1f - Mathf.Exp(-followLerpSpeed * Time.deltaTime);
+            // Unscaled: the pause menu sets timeScale to 0, and a panel that stopped
+            // following the head while paused would be left behind by anyone who turned.
+            float k = 1f - Mathf.Exp(-followLerpSpeed * Time.unscaledDeltaTime);
             transform.position = Vector3.Lerp(transform.position, _targetPosition, k);
             transform.rotation = Quaternion.Slerp(transform.rotation, _targetRotation, k);
         }

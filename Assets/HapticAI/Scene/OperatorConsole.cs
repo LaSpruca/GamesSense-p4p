@@ -40,6 +40,7 @@ namespace HapticAI.Scene
             Participant,
             Condition,
             ConditionSwitch,
+            Diagnostics,
             Server,
             Address,
             TestConnection,
@@ -213,6 +214,9 @@ namespace HapticAI.Scene
                     break;
                 case Row.ConditionSwitch:
                     _settings.lockCondition = !_settings.lockCondition;
+                    break;
+                case Row.Diagnostics:
+                    _settings.showDiagnostics = !_settings.showDiagnostics;
                     break;
                 case Row.Server:
                     _settings.useServer = !_settings.useServer;
@@ -388,6 +392,8 @@ namespace HapticAI.Scene
             rows.Add(Line(Row.Condition, "Haptics condition", ConditionLabel(_settings.condition)));
             rows.Add(Line(Row.ConditionSwitch, "Participant can switch condition",
                 _settings.lockCondition ? "no (locked)" : "yes (B button)"));
+            rows.Add(Line(Row.Diagnostics, "Debug info on screen",
+                _settings.showDiagnostics ? "shown" : "hidden (participant run)"));
             rows.Add(Line(Row.Server, "Haptics server",
                 _settings.useServer ? "on (laptop)" : "off (on-device only)"));
             rows.Add(Line(Row.Address, "Server address", AddressValue(), dimmed: !addressUsable));
@@ -457,6 +463,11 @@ namespace HapticAI.Scene
                         help = "Locked stops the participant changing condition mid-study with the " +
                                "B button. Leave it locked while collecting data.";
                         break;
+                    case Row.Diagnostics:
+                        help = "The technical lines on the briefing and result screens - haptics " +
+                               "source, palette progress, clip counts. Hide them for a participant " +
+                               "run; they are for you, not for them.";
+                        break;
                     case Row.Server:
                         help = "On routes generation through the laptop. Off runs everything " +
                                "on-device, which always works but is the mock synth, not HaptiGen.";
@@ -506,50 +517,6 @@ namespace HapticAI.Scene
             catch (System.UriFormatException)
             {
                 return false;
-            }
-        }
-
-        /// <summary>
-        /// One axis of the thumbstick turned into discrete steps: one on the first push, then a
-        /// repeat that speeds up while held. Without the acceleration, setting an octet to 200 is
-        /// two hundred deliberate flicks.
-        /// </summary>
-        sealed class AxisRepeat
-        {
-            const float Deadzone = 0.5f;
-            const float ReleaseZone = 0.35f;   // lower than Deadzone: hysteresis, so a wobbling
-                                               // stick near the threshold does not stutter.
-            const float FirstRepeatDelay = 0.4f;
-            const float RepeatDelay = 0.12f;
-            const float FastAfterSeconds = 1.2f;
-            const float FastRepeatDelay = 0.03f;
-
-            int _direction;
-            float _heldSince;
-            float _nextRepeatAt;
-
-            public int Step(float value, float now)
-            {
-                int direction = value > Deadzone ? 1 : value < -Deadzone ? -1 : 0;
-
-                if (direction == 0 && Mathf.Abs(value) < ReleaseZone)
-                {
-                    _direction = 0;
-                    return 0;
-                }
-                if (direction == 0) return 0;   // inside the hysteresis band: hold the current state
-
-                if (direction != _direction)
-                {
-                    _direction = direction;
-                    _heldSince = now;
-                    _nextRepeatAt = now + FirstRepeatDelay;
-                    return direction;
-                }
-
-                if (now < _nextRepeatAt) return 0;
-                _nextRepeatAt = now + (now - _heldSince > FastAfterSeconds ? FastRepeatDelay : RepeatDelay);
-                return direction;
             }
         }
     }
