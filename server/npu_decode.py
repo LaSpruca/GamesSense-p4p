@@ -16,6 +16,7 @@ static shape at a time and clip duration determines the token count.
 from __future__ import annotations
 
 import os
+import warnings
 from typing import Dict, Optional, Tuple
 
 
@@ -84,7 +85,22 @@ class NpuEncodecDecoder:
             core.set_property({"CACHE_DIR": self._cache_dir})
 
             example = codes.detach().cpu().to(torch.int32)
-            with torch.no_grad():
+            with torch.no_grad(), warnings.catch_warnings():
+                # convert_model traces the decoder, and EnCodec's decode path trips four
+                # TracerWarnings that are all expected here, because we compile one blob per
+                # exact input shape (keyed on tuple(codes.shape), pinned by the PartialShape
+                # below) and never reuse it for another:
+                #   * core_vq.decode's `torch.tensor(0.0)` accumulator -> a constant 0.0, which
+                #     is what it is on every call anyway;
+                #   * core_vq.decode iterating its input -> unrolls over dim 0, which is n_q
+                #     (codes reach vq.decode as [K, B, T]), fixed by the model config;
+                #   * conv.py's padding arithmetic and its two asserts -> constant-folded from
+                #     the traced clip length, which is exactly the length this blob serves.
+                # A mismatched shape can't silently use the wrong graph: OpenVINO rejects it and
+                # decode() falls back to PyTorch.
+                tracer_warning = getattr(torch.jit, "TracerWarning", None)
+                if tracer_warning is not None:
+                    warnings.simplefilter("ignore", tracer_warning)
                 ov_model = ov.convert_model(
                     _DecodeOnly(self._model).eval(),
                     example_input=example,
