@@ -37,6 +37,7 @@ Setup (see README.md for detail):
 
 import argparse
 import io
+import threading
 import wave
 from typing import Dict, Optional
 
@@ -87,6 +88,8 @@ class HapticsRequest(BaseModel):
 
 app = FastAPI(title="HaptiGen Server")
 _model = None
+# Guards every use of _model. See _synthesize for why.
+_model_lock = threading.Lock()
 _device = device_mod.resolve_device("auto")  # replaced by --device at startup
 _npu_status = "off"
 # Placeholder-synth rate only. The real HapticGen model reports 8000 Hz (25 Hz frame rate) and we
@@ -163,16 +166,26 @@ def _synthesize(prompt: str, duration_s: float, seed: int, candidates: int = 1):
     Returns (samples, sample_rate, info) where info describes how the clip was produced.
     """
     if _model is not None:
-        torch.manual_seed(seed)
-        _model.set_generation_params(duration=max(0.25, duration_s), **_GEN_PARAMS)
         n = max(1, candidates)
-        with torch.no_grad():
-            wavs = _model.generate([prompt] * n)  # [batch, channels, samples]
+        # One generation at a time. FastAPI runs these sync endpoints in a threadpool, so two
+        # requests can land in here at once -- and the model is shared mutable state twice over:
+        # set_generation_params writes to it, and AudioCraft keeps the LM's KV cache in each
+        # attention module's _streaming_state. Overlapping generates interleave their appends to
+        # past_keys/past_values until the two disagree, which trips the shape assert in
+        # transformer.py's _complete_kv. Generation is compute-bound and already saturates the
+        # device, so serialising costs no real throughput.
+        with _model_lock:
+            torch.manual_seed(seed)
+            _model.set_generation_params(duration=max(0.25, duration_s), **_GEN_PARAMS)
+            with torch.no_grad():
+                wavs = _model.generate([prompt] * n)  # [batch, channels, samples]
+            # Read inside the lock: the NPU decoder rewrites this per decode.
+            backend = getattr(_model.compression_model, "last_backend", "torch")
+            sr = int(getattr(_model, "sample_rate", _out_sample_rate))
         mono, peak, p995, rms, degenerate = _pick_best(wavs)
         samples = mono.numpy().astype("float32")
-        sr = int(getattr(_model, "sample_rate", _out_sample_rate))
         info = {
-            "backend": getattr(_model.compression_model, "last_backend", "torch"),
+            "backend": backend,
             "peak": peak,
             "p995": p995,
             "rms": rms,
