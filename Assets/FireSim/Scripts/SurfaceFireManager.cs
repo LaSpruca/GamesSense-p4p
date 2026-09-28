@@ -303,11 +303,19 @@ namespace FireSim
             _soaking = false;
         }
 
+        /// <summary>
+        /// Remove every patch, and anything a patch left behind under the fire root (scorch marks
+        /// released to fade on their own), so the next run starts on a clean room.
+        /// </summary>
         void ClearAllSpots()
         {
             foreach (var spot in _spots)
                 if (spot != null) Destroy(spot.gameObject);
             _spots.Clear();
+
+            if (_fireRoot == null) return;
+            for (int i = _fireRoot.childCount - 1; i >= 0; i--)
+                Destroy(_fireRoot.GetChild(i).gameObject);
         }
 
         void CollectFlammableAnchors()
