@@ -34,6 +34,8 @@ namespace HapticAI.Profiles
         /// <summary>A looping role name, or empty for silence.</summary>
         public string Role;
         public float Gain;
+        /// <summary>Beeps per second the loop is gated into, or 0 for a continuous rumble.</summary>
+        public float PulseHz;
         /// <summary>"rules" or "gemini".</summary>
         public string Source;
         /// <summary>The coarse situation this choice was made for. See <see cref="HapticProfileSelector.CoarseKey"/>.</summary>
@@ -81,13 +83,67 @@ namespace HapticAI.Profiles
             return contact + "|" + tb;
         }
 
+        /// <summary>
+        /// How strongly the spray loop plays for a situation: quiet when the technique is right,
+        /// heavy when it is wrong, so the rumble itself says "you're off". It is the only feedback a
+        /// single-actuator device (the ESP32 motor) can carry, since it cannot render texture.
+        /// Trigger depth deliberately plays no part - a hard squeeze aimed well must stay quiet.
+        /// Must match <c>technique_gain</c> in server/haptic_profiles.py.
+        /// </summary>
+        public static float TechniqueGain(string contact, in SprayReading r) =>
+            IsGoodContact(contact) ? GoodBuzzGain : 1f;
+
+        /// <summary>The steady medium buzz for good technique.</summary>
+        public const float GoodBuzzGain = 0.5f;
+
+        static bool IsGoodContact(string contact) => contact == "sweep" || contact == "base" || contact == "soak";
+
+        /// <summary>
+        /// The rhythm half of the same message: good technique is a continuous medium buzz, poor
+        /// technique is a "thump ... thump" - full-strength hits (<see cref="ThumpSeconds"/> each)
+        /// separated by complete silence, coming faster the further off it is. Decided on the
+        /// headset only - Gemini never changes rhythm.
+        /// </summary>
+        public static float TechniquePulseHz(string contact, in SprayReading r)
+        {
+            if (IsGoodContact(contact)) return 0f;
+            if (contact == "top") return 1.5f + 0.75f * Clamp01(1f - Clamp01(r.HitQuality) / BaseQuality);
+            return 2.5f;   // dry: missing the fire entirely
+        }
+
+        /// <summary>
+        /// How long each thump is on. Long enough for an ERM motor to spin up (~30-50 ms) and land a
+        /// solid hit, short enough to read as a knock rather than a buzz.
+        /// </summary>
+        public const float ThumpSeconds = 0.1f;
+
+        /// <summary>
+        /// The range Gemini may choose within for a situation, so its refinements can never invert
+        /// the good-quiet / bad-heavy rule. Must match <c>GAIN_BANDS</c> in server/haptic_profiles.py.
+        /// </summary>
+        public static void GainBand(string contact, out float min, out float max)
+        {
+            if (IsGoodContact(contact)) { min = 0.40f; max = 0.60f; }
+            else { min = 1.00f; max = 1.00f; }
+        }
+
+        /// <summary>The situation part of a coarse key ("base|t1" -> "base"), or the key itself.</summary>
+        public static string ContactOf(string stateKey)
+        {
+            if (string.IsNullOrEmpty(stateKey)) return string.Empty;
+            int bar = stateKey.IndexOf('|');
+            return bar < 0 ? stateKey : stateKey.Substring(0, bar);
+        }
+
+        static float Clamp01(float v) => Math.Max(0f, Math.Min(1f, v));
+
         public static ProfileSelection Rules(in SprayReading r)
         {
             string key = CoarseKey(r);
             if (key == IdleKey) return ProfileSelection.Silence(key);
 
-            string contact = key.Substring(0, key.IndexOf('|'));
-            float gain = 0.45f + 0.55f * Math.Max(0f, Math.Min(1f, r.Trigger));
+            string contact = ContactOf(key);
+            float gain = TechniqueGain(contact, r);
             string role;
             switch (contact)
             {
@@ -97,7 +153,7 @@ namespace HapticAI.Profiles
                 case "soak": role = HapticRoles.SpraySoak; break;
                 default: role = HapticRoles.SprayDry; break;
             }
-            return new ProfileSelection { Role = role, Gain = gain, Source = "rules", StateKey = key, Reason = "rule: " + contact };
+            return new ProfileSelection { Role = role, Gain = gain, PulseHz = TechniquePulseHz(contact, r), Source = "rules", StateKey = key, Reason = "rule: " + contact };
         }
     }
 }

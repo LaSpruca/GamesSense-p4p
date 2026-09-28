@@ -1,4 +1,5 @@
 using HapticAI.Core;
+using HapticAI.Profiles;
 using UnityEngine;
 
 namespace HapticAI.Scene
@@ -126,10 +127,11 @@ namespace HapticAI.Scene
         /// generated one does not click. <paramref name="gain"/> is applied per slice, so a gain
         /// change needs no re-render either.
         /// </summary>
-        public void SetSustained(HapticClipData data, float gain = 1f, HapticHand hand = HapticHand.Right)
+        public void SetSustained(HapticClipData data, float gain = 1f, HapticHand hand = HapticHand.Right,
+            float pulseHz = 0f)
         {
             if (data == null || data.Amplitudes.Length == 0) return;
-            OutputFor(hand).SetLoop(data.Amplitudes, gain);
+            OutputFor(hand).SetLoop(data.Amplitudes, gain, pulseHz);
             CheckAvailable();
         }
 
@@ -211,11 +213,27 @@ namespace HapticAI.Scene
             public OVRHaptics.OVRHapticsChannel Channel => _channel();
             public float BusyUntil { get; set; }
 
-            public void SetLoop(byte[] samples, float gain)
+            float _pulseHz;
+
+            public void SetLoop(byte[] samples, float gain, float pulseHz)
             {
                 _loop = samples;
                 _gain = gain < 0f ? 0f : gain;
+                _pulseHz = pulseHz > 0f ? pulseHz : 0f;
                 if (_read >= samples.Length) _read = 0;
+            }
+
+            /// <summary>
+            /// Whether the loop is audible at time <paramref name="t"/>: always when continuous, else
+            /// only for the first <see cref="HapticProfileSelector.ThumpSeconds"/> of each cycle - a
+            /// short thump, then a gap. Tied to the clock, not the read position, so the Quest slices
+            /// and the <see cref="LevelAt"/> mirror thump in step.
+            /// </summary>
+            bool PulseOn(float t)
+            {
+                if (_pulseHz <= 0f) return true;
+                float period = 1f / _pulseHz;
+                return t % period < HapticProfileSelector.ThumpSeconds;
             }
 
             public void ClearLoop()
@@ -255,9 +273,11 @@ namespace HapticAI.Scene
                     if (pos < _cue.Length) return WindowMean(_cue, pos, window, wrap: false) * _cueGain;
                     _cue = null;
                 }
-                if (_loop == null || _loop.Length == 0) return 0f;
-                int loopPos = (int)((long)(now * rate) % _loop.Length);
-                return WindowMean(_loop, loopPos, window, wrap: true) * _gain;
+                if (_loop == null || _loop.Length == 0 || !PulseOn(now)) return 0f;
+                // A single motor cannot render the loop's texture, and following its envelope made
+                // the buzz wander and read weaker than intended. Report the level itself: the
+                // chosen gain for the buzz, full scale for a thump.
+                return _pulseHz > 0f ? 1f : Mathf.Min(1f, _gain);
             }
 
             static float WindowMean(byte[] samples, int start, int count, bool wrap)
@@ -295,7 +315,12 @@ namespace HapticAI.Scene
                     var buffer = new byte[sliceSamples];
                     for (int s = 0; s < sliceSamples; s++)
                     {
-                        buffer[s] = Scale(_loop[_read], _gain);
+                        // Thumps are binary - full scale or nothing - so they cannot be mistaken
+                        // for the buzz; the buzz keeps the clip's texture at the chosen gain.
+                        bool on = PulseOn(BusyUntil + s / (float)rate);
+                        buffer[s] = !on ? (byte)0
+                            : _pulseHz > 0f ? (byte)255
+                            : Scale(_loop[_read], _gain);
                         _read = (_read + 1) % _loop.Length;
                     }
                     Channel.Queue(new OVRHapticsClip(buffer, sliceSamples));

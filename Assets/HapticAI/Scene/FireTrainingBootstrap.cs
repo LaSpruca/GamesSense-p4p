@@ -174,11 +174,12 @@ namespace HapticAI.Scene
         }
 
         /// <summary>
-        /// Below a few percent a waveform is effectively silent, but the firmware floors any non-zero
-        /// command to the motor's spin threshold - so without a deadzone, faint tails would buzz.
+        /// The firmware floors any non-zero command to the motor's spin threshold, so a small deadzone
+        /// keeps near-silent cue tails from buzzing. It must stay well below the quiet "good technique"
+        /// loop (gain 0.2 of a clip whose mean amplitude may be ~0.3), or that loop would go silent.
         /// </summary>
         static int ToMotorPercent(float level) =>
-            level < 0.05f ? 0 : Mathf.Clamp(Mathf.RoundToInt(level * 100f), 1, 100);
+            level < 0.02f ? 0 : Mathf.Clamp(Mathf.RoundToInt(level * 100f), 1, 100);
 
         /// <summary>Mode B: the ESP32's reed+force go to the server; its selection drives the motor.</summary>
         void BuildEspGeminiLoop()

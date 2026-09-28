@@ -51,6 +51,7 @@ namespace HapticAI.Scene
         bool _hasOverride;
         string _loopRole;
         float _loopGain = -1f;
+        float _loopPulseHz = -1f;
         HapticClipData _loopClip;
         float _nextStateSendAt;
         bool _sentIdle = true;
@@ -161,16 +162,24 @@ namespace HapticAI.Scene
                 return;
             }
 
-            var clip = _library.ClipFor(chosen.Role, out float profileGain, out bool isFallback);
-            float gain = chosen.Gain * profileGain;
-            bool changed = !ReferenceEquals(clip, _loopClip) || chosen.Role != _loopRole || Mathf.Abs(gain - _loopGain) > 0.02f;
+            // The palette's per-role gain is not applied here: the spray loop's strength IS the
+            // technique signal (a fixed medium buzz vs full-scale thumps), so it must not drift
+            // with whatever loudness the planner gave each role.
+            var clip = _library.ClipFor(chosen.Role, out _, out bool isFallback);
+            float gain = chosen.Gain;
+            // Rhythm always comes from the live reading, even under a Gemini override (which only
+            // refines strength), so the beeping speeds up the moment aim drifts.
+            float pulseHz = rules.PulseHz;
+            bool changed = !ReferenceEquals(clip, _loopClip) || chosen.Role != _loopRole ||
+                           Mathf.Abs(gain - _loopGain) > 0.02f || Mathf.Abs(pulseHz - _loopPulseHz) > 0.25f;
             if (!changed) return;
 
             bool roleChanged = chosen.Role != _loopRole;
-            _player.SetSustained(clip, gain);
+            _player.SetSustained(clip, gain, HapticHand.Right, pulseHz);
             _loopClip = clip;
             _loopRole = chosen.Role;
             _loopGain = gain;
+            _loopPulseHz = pulseHz;
             CurrentSelection = $"{chosen.Role} ({chosen.Source})";
             if (roleChanged)
             {
@@ -185,6 +194,7 @@ namespace HapticAI.Scene
             _loopRole = null;
             _loopClip = null;
             _loopGain = -1f;
+            _loopPulseHz = -1f;
             _hasOverride = false;
             CurrentSelection = "(silent)";
         }
@@ -232,10 +242,12 @@ namespace HapticAI.Scene
             string role = profile != null ? profile.Role : select.profile;
             if (!HapticRoles.IsLoop(role)) return;
 
+            HapticProfileSelector.GainBand(HapticProfileSelector.ContactOf(select.state_key),
+                out float minGain, out float maxGain);
             _override = new ProfileSelection
             {
                 Role = role,
-                Gain = Mathf.Clamp(select.gain, 0.2f, 1f),
+                Gain = Mathf.Clamp(select.gain, minGain, maxGain),
                 Source = "gemini",
                 StateKey = select.state_key ?? string.Empty,
                 Reason = select.reason,

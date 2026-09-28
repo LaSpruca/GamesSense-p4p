@@ -246,14 +246,31 @@ def coarse_state_key(state: Dict[str, Any]) -> str:
     return f"{contact}|{tb}"
 
 
+GOOD_CONTACTS = ("sweep", "base", "soak")
+GOOD_BUZZ_GAIN = 0.5
+
+# Range Gemini may pick within per situation: a little leeway on the good-technique buzz, none on
+# poor technique, which the headset plays as full-scale thumps. Must match
+# HapticProfileSelector.GainBand.
+GAIN_BANDS = {**{c: (0.40, 0.60) for c in GOOD_CONTACTS}, "top": (1.0, 1.0), "dry": (1.0, 1.0)}
+
+
+def technique_gain(contact: str, state: Dict[str, Any]) -> float:
+    """
+    Spray loop strength: a steady medium buzz for good technique, full strength for poor (the
+    headset plays that as thumps separated by silence). Trigger depth plays no part.
+    Must match HapticProfileSelector.TechniqueGain.
+    """
+    return GOOD_BUZZ_GAIN if contact in GOOD_CONTACTS else 1.0
+
+
 def rule_select(state: Dict[str, Any]) -> Selection:
     """Port of HapticProfileSelector.cs. Used server-side only as Gemini's stand-in."""
     key = coarse_state_key(state)
     if key == "idle":
         return Selection("", 0.0, "rules", "not spraying", key)
     contact, tb = key.split("|")
-    trig = float(state.get("trigger", 0.0))
-    gain = 0.45 + 0.55 * max(0.0, min(1.0, trig))
+    gain = technique_gain(contact, state)
     profile = {"dry": "spray_dry", "top": "spray_top", "base": "spray_base",
                "sweep": "spray_sweep", "soak": "spray_soak"}[contact]
     return Selection(profile, gain, "rules", f"rule: {contact}", key)
@@ -284,7 +301,9 @@ DIRECTOR_SYSTEM = (
     "reinforces correct technique: spray_base when foam lands on the base (hit_quality high), "
     "spray_sweep when it is also sweeping, spray_top when foam lands on the tips (hit_quality low), "
     "spray_dry when it is missing (hit_rate near 0), spray_soak when soaking a smouldering patch. "
-    "Gain should follow trigger depth and, for good technique, sit a little higher than for poor.\n"
+    "Gain is NOT trigger depth: good technique (foam on the base, sweeping or soaking) is a steady "
+    "medium buzz - gain 0.4-0.6. Poor technique (flame tips, or missing the fire) is always gain 1.0; "
+    "the headset turns it into full-strength thumps.\n"
     + READING_FIELDS
 )
 
@@ -705,5 +724,6 @@ class ProfilePlanner:
             gain = float(data.get("gain", rules.gain))
         except (TypeError, ValueError):
             gain = rules.gain
-        gain = max(0.2, min(1.0, gain))
+        low, high = GAIN_BANDS[rules.state_key.split("|")[0]]
+        gain = max(low, min(high, gain))
         return Selection(profile, gain, "gemini", str(data.get("reason", ""))[:80], rules.state_key)
