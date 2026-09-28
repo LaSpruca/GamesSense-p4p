@@ -16,8 +16,9 @@ namespace HapticAI.Scene
     /// and builds everything else in code so nothing needs hand-wiring:
     ///
     ///   * Insight Passthrough as an underlay, with the eye cameras cleared to transparent.
-    ///   * MRUK loading the room, plus an EffectMesh producing invisible colliders on every
-    ///     detected surface (so foam splashes on them and fire sits on them).
+    ///   * MRUK loading the room, plus an EffectMesh producing colliders on every detected
+    ///     surface (so foam splashes on them and fire sits on them), rendered only as the light
+    ///     the fire throws onto the real room.
     ///   * A SurfaceFireManager that runs the staged drill across those surfaces.
     ///   * A foam sprayer at the tip of the right controller, driven by the index trigger.
     ///   * The haptics stack: a palette of profiles planned for THIS room, played by the relay.
@@ -401,7 +402,10 @@ namespace HapticAI.Scene
                 MRUKAnchor.SceneLabels.OTHER | MRUKAnchor.SceneLabels.DOOR_FRAME | MRUKAnchor.SceneLabels.WINDOW_FRAME |
                 MRUKAnchor.SceneLabels.PLANT | MRUKAnchor.SceneLabels.LAMP;
             effectMesh.Colliders = true;
-            effectMesh.MeshMaterial = null;
+            // Not invisible any more, but not visible either: the room-light material draws nothing
+            // of the mesh itself and only adds the flames' light to the passthrough view of the real
+            // surfaces. Null (shader missing) puts it back to colliders only.
+            effectMesh.MeshMaterial = FireSimVisuals.RoomLightMaterial;
             effectMesh.CastShadow = false;
 
             mrukGo.SetActive(true);   // Awake() runs now, with the settings above in place.

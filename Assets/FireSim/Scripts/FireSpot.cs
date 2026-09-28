@@ -47,8 +47,8 @@ namespace FireSim
     }
 
     /// <summary>
-    /// A single burning patch sitting on a detected surface. It renders flame particles,
-    /// holds "health" that foam reduces, and exposes its position/normal/anchor so the
+    /// A single burning patch sitting on a detected surface. It renders the fire, holds "health"
+    /// that foam reduces, and exposes its position/normal/anchor so the
     /// <see cref="SurfaceFireManager"/> can spread fire from it to nearby surfaces.
     ///
     /// Foam reaches a spot through Unity's particle collision messages: the foam particle
@@ -68,6 +68,13 @@ namespace FireSim
     ///   * Re-ignition. At zero health the patch smoulders instead of dying. Soak it and it goes
     ///     out; walk away and it will most likely flare back.
     ///
+    /// The picture is layered from several cheap parts so it holds up in passthrough on a headset:
+    /// flame tongues (a procedural erosion shader on stretched billboards) over a hot core, smoke
+    /// rising off the top, the odd spark, a scorch mark with glowing embers on the surface itself,
+    /// steam where foam lands, and the flames' light thrown onto the real room through
+    /// <see cref="FireLightField"/>. Every layer scales with health, so a patch being knocked
+    /// down visibly weakens and one left alone visibly recovers.
+    ///
     /// Lifecycle as the manager sees it: IsBurning -> (flames out: OnSpotExtinguished) ->
     /// [IsSmouldering: OnSpotSmouldering -> maybe OnSpotReignited -> back to IsBurning]* ->
     /// out for good: OnSpotOut -> destroyed.
@@ -75,13 +82,32 @@ namespace FireSim
     [RequireComponent(typeof(CapsuleCollider))]
     public class FireSpot : MonoBehaviour
     {
-        const float MaxEmissionRate = 50f;
-        const float MaxGlowIntensity = 1.5f;
-        const float SmoulderGlowIntensity = 0.15f;
+        // Emission rates at full health. Each flame particle is a whole tongue, so these are low.
+        const float FlameRate = 26f;
+        const float CoreRate = 10f;
+        const float SmokeRate = 5f;
+        const float SparkRate = 5f;
+        const float SmoulderSmokeRate = 2.5f;
+        const float EmberRate = 9f;
+
+        const float MaxGlowIntensity = 1.6f;
+        const float SmoulderGlowFraction = 0.16f;
+        /// <summary>How far the light reaches across the real room, in metres.</summary>
+        const float RoomLightRange = 1.7f;
+        /// <summary>Seconds of burning after which the surface is fully sooted.</summary>
+        const float FullCharSeconds = 14f;
+        /// <summary>How long a released scorch mark lingers before it has faded away.</summary>
+        const float ScorchFadeSeconds = 30f;
+        /// <summary>Steam particles per foam hit, on average.</summary>
+        const float SteamPerHit = 0.12f;
+
         /// <summary>A sector counts as "covered" if foam landed on it this recently.</summary>
         const float CoverageWindow = 0.6f;
         /// <summary>Share of damage on a dead sector that leaks into the live ones.</summary>
         const float SpillFraction = 0.25f;
+
+        static readonly Color FlameLightColor = new Color(1f, 0.56f, 0.2f);
+        static readonly Color EmberLightColor = new Color(1f, 0.38f, 0.1f);
 
         public MRUKAnchor Anchor { get; private set; }
         public Vector3 Position => transform.position;
@@ -123,7 +149,12 @@ namespace FireSim
 
         SurfaceFireManager _manager;
         ParticleSystem _flames;
+        ParticleSystem _core;
+        ParticleSystem _smoke;
+        ParticleSystem _sparks;
+        ParticleSystem _steam;
         ParticleSystem _embers;
+        ScorchMark _scorch;
         Light _glow;
         FireSpotSettings _settings;
         float _maxHealth;
@@ -133,6 +164,10 @@ namespace FireSim
         float _lastFoamTime = -999f;
         float _soakSeconds;
         float _flickerSeed;
+        float _burnSeconds;
+        float _steamDebt;
+        /// <summary>Current light output as a fraction of full, flicker included.</summary>
+        float _lightLevel;
         bool _isOut;
         readonly List<ParticleCollisionEvent> _collisionEvents = new List<ParticleCollisionEvent>();
 
@@ -167,9 +202,15 @@ namespace FireSim
             transform.rotation = Quaternion.LookRotation(surfaceNormal);
 
             BuildCollider();
-            BuildFlames(settings.Radius);
+            _scorch = ScorchMark.Create(transform, settings.Radius);
+            BuildFlames(settings.Radius, settings.FlameHeight);
+            BuildCore(settings.Radius, settings.FlameHeight);
+            BuildSmoke(settings.Radius, settings.FlameHeight);
+            BuildSparks(settings.Radius);
+            BuildSteam(settings.Radius);
             BuildGlow(settings.Radius);
             if (settings.ReigniteEnabled) BuildEmbers(settings.Radius);
+            FireLightField.Register(this);
 
             // Pop in so spreading reads as growth rather than instant appearance.
             StartCoroutine(GrowIn());
@@ -192,103 +233,335 @@ namespace FireSim
             capsule.center = new Vector3(0f, 0f, capsule.height * 0.5f);
         }
 
-        void BuildFlames(float radius)
+        // --- Visual layers ------------------------------------------------------------------
+
+        /// <summary>
+        /// A stopped, looping, world-space particle system on a new child, with the shared
+        /// FireSim material and vertex streams applied. Every layer starts from this.
+        /// </summary>
+        ParticleSystem NewLayer(string name, Material material, int maxParticles, float sortingFudge)
         {
-            var flamesGo = new GameObject("Flames");
-            flamesGo.transform.SetParent(transform, false);
-            // Local +Z is the surface normal; flames should travel along it.
-            _flames = flamesGo.AddComponent<ParticleSystem>();
-            _flames.Stop(true, ParticleSystemStopBehavior.StopEmittingAndClear);
+            var go = new GameObject(name);
+            go.transform.SetParent(transform, false);
+            var ps = go.AddComponent<ParticleSystem>();
+            ps.Stop(true, ParticleSystemStopBehavior.StopEmittingAndClear);
+
+            var main = ps.main;
+            main.loop = true;
+            main.playOnAwake = false;
+            main.simulationSpace = ParticleSystemSimulationSpace.World;
+            main.maxParticles = maxParticles;
+
+            var renderer = ps.GetComponent<ParticleSystemRenderer>();
+            FireSimVisuals.ApplyParticleMaterial(renderer, material);
+            renderer.sortingFudge = sortingFudge;
+            return ps;
+        }
+
+        /// <summary>
+        /// The tongues. Tall billboards emitted from the base along the surface normal, then lifted
+        /// by buoyancy (negative gravity) so a wall fire still licks upward, with a little noise so
+        /// no two rise the same way. The shader does the flickering and erosion per pixel.
+        /// </summary>
+        void BuildFlames(float radius, float height)
+        {
+            _flames = NewLayer("Flames", FireSimVisuals.FlameMaterial, 80, -5f);
 
             var main = _flames.main;
-            main.loop = true;
-            main.startLifetime = new ParticleSystem.MinMaxCurve(0.4f, 0.9f);
-            main.startSpeed = new ParticleSystem.MinMaxCurve(0.3f * radius * 10f, 0.7f * radius * 10f);
-            main.startSize = new ParticleSystem.MinMaxCurve(radius * 0.8f, radius * 1.6f);
-            main.simulationSpace = ParticleSystemSimulationSpace.World;
-            main.maxParticles = 200;
+            main.startLifetime = new ParticleSystem.MinMaxCurve(0.55f, 1.0f);
+            main.startSpeed = new ParticleSystem.MinMaxCurve(height * 0.6f, height * 1.3f);
+            main.startSize3D = true;
+            main.startSizeX = new ParticleSystem.MinMaxCurve(radius * 1.3f, radius * 2.0f);
+            main.startSizeY = new ParticleSystem.MinMaxCurve(height * 0.7f, height * 1.0f);
+            main.startSizeZ = new ParticleSystem.MinMaxCurve(1f);
+            main.startRotation = new ParticleSystem.MinMaxCurve(-0.2f, 0.2f);
+            main.gravityModifier = new ParticleSystem.MinMaxCurve(-0.22f);
             main.startColor = new ParticleSystem.MinMaxGradient(
-                new Color(1f, 0.75f, 0.2f, 1f), new Color(1f, 0.35f, 0.05f, 1f));
+                new Color(1f, 1f, 1f, 1f), new Color(1f, 0.9f, 0.8f, 1f));
 
             var emission = _flames.emission;
-            emission.rateOverTime = MaxEmissionRate;
+            emission.rateOverTime = FlameRate;
 
             var shape = _flames.shape;
-            shape.shapeType = ParticleSystemShapeType.Hemisphere;
-            shape.radius = radius * 0.6f;
+            shape.shapeType = ParticleSystemShapeType.Cone;
+            shape.angle = 12f;
+            shape.radius = radius * 0.55f;
+            shape.radiusThickness = 1f;
 
-            // Fade out and shrink near end of life for a flame-like taper.
-            var colorOverLifetime = _flames.colorOverLifetime;
-            colorOverLifetime.enabled = true;
+            var colour = _flames.colorOverLifetime;
+            colour.enabled = true;
             var grad = new Gradient();
             grad.SetKeys(
-                new[] { new GradientColorKey(new Color(1f, 0.8f, 0.3f), 0f), new GradientColorKey(new Color(0.6f, 0.1f, 0.05f), 1f) },
-                new[] { new GradientAlphaKey(0f, 0f), new GradientAlphaKey(1f, 0.2f), new GradientAlphaKey(0f, 1f) });
-            colorOverLifetime.color = new ParticleSystem.MinMaxGradient(grad);
+                new[]
+                {
+                    new GradientColorKey(new Color(1f, 1f, 1f), 0f),
+                    new GradientColorKey(new Color(1f, 0.8f, 0.55f), 0.45f),
+                    new GradientColorKey(new Color(0.9f, 0.35f, 0.15f), 0.85f),
+                    new GradientColorKey(new Color(0.6f, 0.15f, 0.08f), 1f),
+                },
+                new[]
+                {
+                    new GradientAlphaKey(0f, 0f), new GradientAlphaKey(1f, 0.08f),
+                    new GradientAlphaKey(1f, 0.6f), new GradientAlphaKey(0f, 1f),
+                });
+            colour.color = new ParticleSystem.MinMaxGradient(grad);
 
-            var sizeOverLifetime = _flames.sizeOverLifetime;
-            sizeOverLifetime.enabled = true;
-            sizeOverLifetime.size = new ParticleSystem.MinMaxCurve(1f,
-                new AnimationCurve(new Keyframe(0f, 0.4f), new Keyframe(0.3f, 1f), new Keyframe(1f, 0.1f)));
+            var size = _flames.sizeOverLifetime;
+            size.enabled = true;
+            size.separateAxes = true;
+            size.x = new ParticleSystem.MinMaxCurve(1f,
+                new AnimationCurve(new Keyframe(0f, 0.7f), new Keyframe(0.3f, 1f), new Keyframe(1f, 0.45f)));
+            size.y = new ParticleSystem.MinMaxCurve(1f,
+                new AnimationCurve(new Keyframe(0f, 0.6f), new Keyframe(0.35f, 1f), new Keyframe(1f, 0.7f)));
+            size.z = new ParticleSystem.MinMaxCurve(1f);
 
-            var renderer = _flames.GetComponent<ParticleSystemRenderer>();
-            renderer.material = FireSimVisuals.AdditiveParticleMaterial;
-            renderer.sortingFudge = -5f;
+            var rotation = _flames.rotationOverLifetime;
+            rotation.enabled = true;
+            rotation.z = new ParticleSystem.MinMaxCurve(-0.35f, 0.35f);
+
+            var noise = _flames.noise;
+            noise.enabled = true;
+            noise.strength = new ParticleSystem.MinMaxCurve(radius * 0.9f);
+            noise.frequency = 0.55f;
+            noise.scrollSpeed = 0.7f;
+            noise.damping = true;
+            noise.quality = ParticleSystemNoiseQuality.Low;
 
             _flames.Play();
+        }
+
+        /// <summary>The hot, near-white base of the fire: small, quick, tightly packed tongues.</summary>
+        void BuildCore(float radius, float height)
+        {
+            _core = NewLayer("Core", FireSimVisuals.FlameMaterial, 30, -6f);
+
+            var main = _core.main;
+            main.startLifetime = new ParticleSystem.MinMaxCurve(0.3f, 0.55f);
+            main.startSpeed = new ParticleSystem.MinMaxCurve(height * 0.3f, height * 0.7f);
+            main.startSize3D = true;
+            main.startSizeX = new ParticleSystem.MinMaxCurve(radius * 0.8f, radius * 1.2f);
+            main.startSizeY = new ParticleSystem.MinMaxCurve(height * 0.35f, height * 0.55f);
+            main.startSizeZ = new ParticleSystem.MinMaxCurve(1f);
+            main.startRotation = new ParticleSystem.MinMaxCurve(-0.15f, 0.15f);
+            main.gravityModifier = new ParticleSystem.MinMaxCurve(-0.1f);
+            main.startColor = new Color(1f, 0.98f, 0.9f, 1f);
+
+            var emission = _core.emission;
+            emission.rateOverTime = CoreRate;
+
+            var shape = _core.shape;
+            shape.shapeType = ParticleSystemShapeType.Cone;
+            shape.angle = 8f;
+            shape.radius = radius * 0.35f;
+            shape.radiusThickness = 1f;
+
+            var colour = _core.colorOverLifetime;
+            colour.enabled = true;
+            var grad = new Gradient();
+            grad.SetKeys(
+                new[] { new GradientColorKey(Color.white, 0f), new GradientColorKey(new Color(1f, 0.85f, 0.6f), 1f) },
+                new[] { new GradientAlphaKey(0f, 0f), new GradientAlphaKey(1f, 0.15f), new GradientAlphaKey(0f, 1f) });
+            colour.color = new ParticleSystem.MinMaxGradient(grad);
+
+            _core.Play();
+        }
+
+        /// <summary>
+        /// Smoke off the top of the flames: slow, dark, swelling puffs that thin out as they rise.
+        /// In passthrough this is the layer that most sells the fire, because it darkens the real
+        /// room behind it. Recoloured pale grey while smouldering.
+        /// </summary>
+        void BuildSmoke(float radius, float height)
+        {
+            _smoke = NewLayer("Smoke", FireSimVisuals.SmokeMaterial, 40, 0f);
+
+            var main = _smoke.main;
+            main.startLifetime = new ParticleSystem.MinMaxCurve(1.8f, 3.0f);
+            main.startSpeed = new ParticleSystem.MinMaxCurve(0.3f, 0.55f);
+            main.startSize = new ParticleSystem.MinMaxCurve(radius * 1.3f, radius * 2.1f);
+            main.startRotation = new ParticleSystem.MinMaxCurve(-3.14f, 3.14f);
+            main.gravityModifier = new ParticleSystem.MinMaxCurve(-0.1f);
+            main.startColor = new ParticleSystem.MinMaxGradient(
+                new Color(0.13f, 0.12f, 0.12f, 0.5f), new Color(0.22f, 0.2f, 0.19f, 0.4f));
+
+            var emission = _smoke.emission;
+            emission.rateOverTime = SmokeRate;
+
+            var shape = _smoke.shape;
+            shape.shapeType = ParticleSystemShapeType.Cone;
+            shape.angle = 18f;
+            shape.radius = radius * 0.4f;
+            shape.radiusThickness = 1f;
+            shape.position = new Vector3(0f, 0f, height * 0.6f);
+
+            var colour = _smoke.colorOverLifetime;
+            colour.enabled = true;
+            var grad = new Gradient();
+            grad.SetKeys(
+                new[] { new GradientColorKey(Color.white, 0f), new GradientColorKey(Color.white, 1f) },
+                new[]
+                {
+                    new GradientAlphaKey(0f, 0f), new GradientAlphaKey(1f, 0.15f),
+                    new GradientAlphaKey(0.7f, 0.6f), new GradientAlphaKey(0f, 1f),
+                });
+            colour.color = new ParticleSystem.MinMaxGradient(grad);
+
+            var size = _smoke.sizeOverLifetime;
+            size.enabled = true;
+            size.size = new ParticleSystem.MinMaxCurve(1f,
+                new AnimationCurve(new Keyframe(0f, 0.5f), new Keyframe(1f, 1.7f)));
+
+            var rotation = _smoke.rotationOverLifetime;
+            rotation.enabled = true;
+            rotation.z = new ParticleSystem.MinMaxCurve(-0.3f, 0.3f);
+
+            var noise = _smoke.noise;
+            noise.enabled = true;
+            noise.strength = new ParticleSystem.MinMaxCurve(0.12f);
+            noise.frequency = 0.35f;
+            noise.scrollSpeed = 0.3f;
+            noise.damping = true;
+            noise.quality = ParticleSystemNoiseQuality.Low;
+
+            _smoke.Play();
+        }
+
+        /// <summary>The occasional spark carried up out of the flames on a wandering path.</summary>
+        void BuildSparks(float radius)
+        {
+            _sparks = NewLayer("Sparks", FireSimVisuals.GlowMaterial, 24, -7f);
+
+            var main = _sparks.main;
+            main.startLifetime = new ParticleSystem.MinMaxCurve(0.6f, 1.4f);
+            main.startSpeed = new ParticleSystem.MinMaxCurve(0.5f, 1.3f);
+            main.startSize = new ParticleSystem.MinMaxCurve(0.006f, 0.014f);
+            main.gravityModifier = new ParticleSystem.MinMaxCurve(-0.05f);
+            main.startColor = new ParticleSystem.MinMaxGradient(
+                new Color(1f, 0.75f, 0.3f, 1f), new Color(1f, 0.5f, 0.15f, 1f));
+
+            var emission = _sparks.emission;
+            emission.rateOverTime = SparkRate;
+
+            var shape = _sparks.shape;
+            shape.shapeType = ParticleSystemShapeType.Cone;
+            shape.angle = 20f;
+            shape.radius = radius * 0.5f;
+            shape.radiusThickness = 1f;
+
+            var colour = _sparks.colorOverLifetime;
+            colour.enabled = true;
+            var grad = new Gradient();
+            grad.SetKeys(
+                new[] { new GradientColorKey(new Color(1f, 0.9f, 0.6f), 0f), new GradientColorKey(new Color(1f, 0.3f, 0.05f), 1f) },
+                new[] { new GradientAlphaKey(1f, 0f), new GradientAlphaKey(1f, 0.7f), new GradientAlphaKey(0f, 1f) });
+            colour.color = new ParticleSystem.MinMaxGradient(grad);
+
+            var noise = _sparks.noise;
+            noise.enabled = true;
+            noise.strength = new ParticleSystem.MinMaxCurve(0.35f);
+            noise.frequency = 1.2f;
+            noise.scrollSpeed = 1f;
+            noise.damping = true;
+            noise.quality = ParticleSystemNoiseQuality.Low;
+
+            var renderer = _sparks.GetComponent<ParticleSystemRenderer>();
+            renderer.renderMode = ParticleSystemRenderMode.Stretch;
+            renderer.velocityScale = 0.06f;
+            renderer.lengthScale = 1.5f;
+
+            _sparks.Play();
+        }
+
+        /// <summary>Steam where foam meets the fire. Emitted per hit from OnParticleCollision.</summary>
+        void BuildSteam(float radius)
+        {
+            _steam = NewLayer("Steam", FireSimVisuals.SmokeMaterial, 40, -1f);
+
+            var main = _steam.main;
+            main.startLifetime = new ParticleSystem.MinMaxCurve(0.9f, 1.6f);
+            main.startSpeed = new ParticleSystem.MinMaxCurve(0.45f, 0.9f);
+            main.startSize = new ParticleSystem.MinMaxCurve(radius * 0.9f, radius * 1.5f);
+            main.startRotation = new ParticleSystem.MinMaxCurve(-3.14f, 3.14f);
+            main.gravityModifier = new ParticleSystem.MinMaxCurve(-0.18f);
+            main.startColor = new ParticleSystem.MinMaxGradient(
+                new Color(0.88f, 0.9f, 0.93f, 0.42f), new Color(0.75f, 0.77f, 0.8f, 0.35f));
+
+            var emission = _steam.emission;
+            emission.rateOverTime = 0f;   // driven by foam hits
+
+            var shape = _steam.shape;
+            shape.shapeType = ParticleSystemShapeType.Cone;
+            shape.angle = 30f;
+            shape.radius = radius * 0.6f;
+            shape.radiusThickness = 1f;
+
+            var colour = _steam.colorOverLifetime;
+            colour.enabled = true;
+            var grad = new Gradient();
+            grad.SetKeys(
+                new[] { new GradientColorKey(Color.white, 0f), new GradientColorKey(Color.white, 1f) },
+                new[] { new GradientAlphaKey(0f, 0f), new GradientAlphaKey(1f, 0.15f), new GradientAlphaKey(0f, 1f) });
+            colour.color = new ParticleSystem.MinMaxGradient(grad);
+
+            var size = _steam.sizeOverLifetime;
+            size.enabled = true;
+            size.size = new ParticleSystem.MinMaxCurve(1f,
+                new AnimationCurve(new Keyframe(0f, 0.6f), new Keyframe(1f, 1.9f)));
+
+            _steam.Play();
         }
 
         void BuildGlow(float radius)
         {
             var glowGo = new GameObject("Glow");
             glowGo.transform.SetParent(transform, false);
-            glowGo.transform.localPosition = Vector3.forward * radius;
+            glowGo.transform.localPosition = Vector3.forward * (radius * 1.2f);
             _glow = glowGo.AddComponent<Light>();
             _glow.type = LightType.Point;
-            _glow.color = new Color(1f, 0.55f, 0.2f);
-            _glow.range = radius * 8f;
+            _glow.color = FlameLightColor;
+            _glow.range = RoomLightRange;
             _glow.intensity = MaxGlowIntensity;
+            _glow.shadows = LightShadows.None;
         }
 
         /// <summary>
-        /// A few slow, dim orange motes drifting off the surface. Built stopped and only played
-        /// while smouldering - it is the visual tell that the patch is not finished.
+        /// Embers lifting off a smouldering patch: tiny bright motes on a wandering rise. Built
+        /// stopped and only played while smouldering - it is the tell that the patch is not finished.
         /// </summary>
         void BuildEmbers(float radius)
         {
-            var embersGo = new GameObject("Embers");
-            embersGo.transform.SetParent(transform, false);
-            _embers = embersGo.AddComponent<ParticleSystem>();
-            _embers.Stop(true, ParticleSystemStopBehavior.StopEmittingAndClear);
+            _embers = NewLayer("Embers", FireSimVisuals.GlowMaterial, 30, -7f);
 
             var main = _embers.main;
-            main.loop = true;
-            main.startLifetime = new ParticleSystem.MinMaxCurve(1.0f, 2.0f);
-            main.startSpeed = new ParticleSystem.MinMaxCurve(0.05f, 0.15f);
-            main.startSize = new ParticleSystem.MinMaxCurve(0.012f, 0.03f);
-            main.simulationSpace = ParticleSystemSimulationSpace.World;
-            main.maxParticles = 30;
+            main.startLifetime = new ParticleSystem.MinMaxCurve(1.2f, 2.4f);
+            main.startSpeed = new ParticleSystem.MinMaxCurve(0.05f, 0.18f);
+            main.startSize = new ParticleSystem.MinMaxCurve(0.006f, 0.014f);
+            main.gravityModifier = new ParticleSystem.MinMaxCurve(-0.03f);
             main.startColor = new ParticleSystem.MinMaxGradient(
-                new Color(1f, 0.45f, 0.1f, 0.7f), new Color(0.9f, 0.25f, 0.05f, 0.5f));
+                new Color(1f, 0.45f, 0.1f, 1f), new Color(0.95f, 0.28f, 0.05f, 0.8f));
 
             var emission = _embers.emission;
-            emission.rateOverTime = 7f;
+            emission.rateOverTime = EmberRate;
 
             var shape = _embers.shape;
             shape.shapeType = ParticleSystemShapeType.Hemisphere;
-            shape.radius = radius * 0.5f;
+            shape.radius = radius * 0.6f;
 
-            var colorOverLifetime = _embers.colorOverLifetime;
-            colorOverLifetime.enabled = true;
+            var colour = _embers.colorOverLifetime;
+            colour.enabled = true;
             var grad = new Gradient();
             grad.SetKeys(
-                new[] { new GradientColorKey(new Color(1f, 0.5f, 0.15f), 0f), new GradientColorKey(new Color(0.4f, 0.08f, 0.02f), 1f) },
-                new[] { new GradientAlphaKey(0f, 0f), new GradientAlphaKey(0.8f, 0.3f), new GradientAlphaKey(0f, 1f) });
-            colorOverLifetime.color = new ParticleSystem.MinMaxGradient(grad);
+                new[] { new GradientColorKey(new Color(1f, 0.55f, 0.15f), 0f), new GradientColorKey(new Color(0.45f, 0.08f, 0.02f), 1f) },
+                new[] { new GradientAlphaKey(0f, 0f), new GradientAlphaKey(1f, 0.2f), new GradientAlphaKey(0f, 1f) });
+            colour.color = new ParticleSystem.MinMaxGradient(grad);
 
-            var renderer = _embers.GetComponent<ParticleSystemRenderer>();
-            renderer.material = FireSimVisuals.AdditiveParticleMaterial;
-            renderer.sortingFudge = -5f;
+            var noise = _embers.noise;
+            noise.enabled = true;
+            noise.strength = new ParticleSystem.MinMaxCurve(0.12f);
+            noise.frequency = 0.8f;
+            noise.scrollSpeed = 0.6f;
+            noise.damping = true;
+            noise.quality = ParticleSystemNoiseQuality.Low;
         }
 
         System.Collections.IEnumerator GrowIn()
@@ -306,11 +579,16 @@ namespace FireSim
             transform.localScale = target;
         }
 
+        // --- Per-frame ----------------------------------------------------------------------
+
         void Update()
         {
             if (_isOut) return;
+            UpdateAmbience();
             if (IsSmouldering) { UpdateSmouldering(); return; }
             if (!IsBurning) return;
+
+            _burnSeconds += Time.deltaTime;
             if (Time.time - _lastFoamTime < _settings.RecoveryDelay) return;
 
             // Left alone, a knocked-down patch climbs back. This is what stops "spray everything
@@ -325,6 +603,33 @@ namespace FireSim
                 changed = true;
             }
             if (changed) RefreshVisuals();
+        }
+
+        /// <summary>
+        /// The flicker: light, ember glow and soot, every frame in both live states. Two Perlin
+        /// bands - a slow swell and a fast jitter - read as flame rather than a sine wave.
+        /// </summary>
+        void UpdateAmbience()
+        {
+            float t = Time.time;
+            float flicker = 0.78f + 0.22f * Mathf.PerlinNoise(t * 6.5f, _flickerSeed)
+                                  + 0.14f * (Mathf.PerlinNoise(t * 21f, _flickerSeed + 3.3f) - 0.5f);
+            float charAmount = Mathf.Clamp01(0.2f + _burnSeconds / FullCharSeconds);
+
+            if (IsBurning)
+            {
+                float frac = HealthFraction;
+                _lightLevel = Mathf.Lerp(0.2f, 1f, frac) * flicker;
+                if (_glow != null) { _glow.color = FlameLightColor; _glow.intensity = MaxGlowIntensity * _lightLevel; }
+                if (_scorch != null) _scorch.SetState(charAmount, Mathf.Lerp(0.6f, 1.8f, frac) * flicker);
+            }
+            else if (IsSmouldering)
+            {
+                _lightLevel = SmoulderGlowFraction * flicker;
+                if (_glow != null) { _glow.color = EmberLightColor; _glow.intensity = MaxGlowIntensity * _lightLevel; }
+                // Brighter than the light suggests: the embers are the one cue that this is not done.
+                if (_scorch != null) _scorch.SetState(charAmount, 1.1f * flicker);
+            }
         }
 
         /// <summary>
@@ -343,15 +648,27 @@ namespace FireSim
             {
                 if (Random.value < _settings.ReigniteChance) Reignite();
                 else GoOut();
-                return;
-            }
-
-            if (_glow != null)
-            {
-                float flicker = 0.7f + 0.3f * Mathf.PerlinNoise(Time.time * 6f, _flickerSeed);
-                _glow.intensity = SmoulderGlowIntensity * flicker;
             }
         }
+
+        /// <summary>
+        /// This patch as a light on the real room, for <see cref="FireLightField"/>. False once
+        /// there is nothing glowing.
+        /// </summary>
+        public bool TryGetLight(out Vector3 position, out float range, out Color color)
+        {
+            if (_isOut || _glow == null || (!IsBurning && !IsSmouldering))
+            {
+                position = Vector3.zero; range = 0f; color = Color.black;
+                return false;
+            }
+            position = _glow.transform.position;
+            range = RoomLightRange * Mathf.Lerp(0.6f, 1f, _lightLevel);
+            color = _glow.color * (_lightLevel * 1.1f);
+            return true;
+        }
+
+        // --- Foam ---------------------------------------------------------------------------
 
         void OnParticleCollision(GameObject other)
         {
@@ -382,12 +699,24 @@ namespace FireSim
             }
 
             _manager.ReportFoamHit(this, hits, qualitySum / hits, IsSmouldering);
+            EmitSteam(hits);
 
             if (IsBurning)
             {
                 RefreshVisuals();
                 if (AllSectorsDead()) OnHealthDepleted();
             }
+        }
+
+        /// <summary>Steam in proportion to the foam landing, a fraction of a puff per hit.</summary>
+        void EmitSteam(int hits)
+        {
+            if (_steam == null) return;
+            _steamDebt += hits * SteamPerHit;
+            int n = Mathf.FloorToInt(_steamDebt);
+            if (n <= 0) return;
+            _steamDebt -= n;
+            _steam.Emit(Mathf.Min(n, 4));
         }
 
         /// <summary>
@@ -473,14 +802,29 @@ namespace FireSim
             if (AllSectorsDead()) OnHealthDepleted();
         }
 
-        /// <summary>Flames weaken visibly as the patch is doused, and swell again as it recovers.</summary>
+        /// <summary>
+        /// Every layer weakens as the patch is doused and swells again as it recovers. A patch being
+        /// knocked down also smokes harder - the flames are being smothered, not switched off.
+        /// </summary>
         void RefreshVisuals()
         {
             float frac = HealthFraction;
-            var emission = _flames.emission;
-            emission.rateOverTime = Mathf.Lerp(8f, MaxEmissionRate, frac);
-            if (_glow != null) _glow.intensity = Mathf.Lerp(0.2f, MaxGlowIntensity, frac);
+            SetRate(_flames, Mathf.Lerp(5f, FlameRate, frac));
+            SetRate(_core, Mathf.Lerp(1.5f, CoreRate, frac));
+            SetRate(_sparks, Mathf.Lerp(0.5f, SparkRate, frac));
+            float smoke = Mathf.Lerp(SmokeRate * 0.6f, SmokeRate, frac);
+            if (IsBeingDoused) smoke += Mathf.Lerp(6f, 2f, frac);
+            SetRate(_smoke, smoke);
         }
+
+        static void SetRate(ParticleSystem ps, float rate)
+        {
+            if (ps == null) return;
+            var emission = ps.emission;
+            emission.rateOverTime = rate;
+        }
+
+        // --- State changes ------------------------------------------------------------------
 
         /// <summary>
         /// The flames-out moment. The manager hears OnSpotExtinguished either way; what happens
@@ -490,7 +834,9 @@ namespace FireSim
         {
             if (!IsBurning) return;
             IsBurning = false;
-            _flames.Stop(true, ParticleSystemStopBehavior.StopEmitting);
+            StopEmitting(_flames);
+            StopEmitting(_core);
+            StopEmitting(_sparks);
 
             if (_manager != null) _manager.OnSpotExtinguished(this);
 
@@ -503,9 +849,17 @@ namespace FireSim
             IsSmouldering = true;
             _soakSeconds = 0f;
             // The collider stays enabled on purpose: foam must still be able to land so the user
-            // can soak the embers. Glow drops to a dim flicker; the embers system is the tell.
-            if (_glow != null) { _glow.enabled = true; _glow.intensity = SmoulderGlowIntensity; }
+            // can soak the embers. The light drops to a dim flicker; the embers, the glowing scorch
+            // and a thin pale smoke are the tells.
+            if (_glow != null) _glow.enabled = true;
             if (_embers != null) _embers.Play();
+            if (_smoke != null)
+            {
+                var main = _smoke.main;
+                main.startColor = new ParticleSystem.MinMaxGradient(
+                    new Color(0.55f, 0.55f, 0.56f, 0.3f), new Color(0.7f, 0.7f, 0.7f, 0.22f));
+                SetRate(_smoke, SmoulderSmokeRate);
+            }
 
             if (_manager != null) _manager.OnSpotSmouldering(this);
         }
@@ -514,12 +868,20 @@ namespace FireSim
         {
             IsSmouldering = false;
             IsBurning = true;
-            if (_embers != null) _embers.Stop(true, ParticleSystemStopBehavior.StopEmitting);
+            StopEmitting(_embers);
 
             float per = Mathf.Clamp01(_settings.ReigniteHealthFraction) * _maxHealth / _sectorHealth.Length;
             for (int i = 0; i < _sectorHealth.Length; i++) _sectorHealth[i] = per;
 
+            if (_smoke != null)
+            {
+                var main = _smoke.main;
+                main.startColor = new ParticleSystem.MinMaxGradient(
+                    new Color(0.13f, 0.12f, 0.12f, 0.5f), new Color(0.22f, 0.2f, 0.19f, 0.4f));
+            }
             _flames.Play();
+            if (_core != null) _core.Play();
+            if (_sparks != null) _sparks.Play();
             if (_glow != null) _glow.enabled = true;
             RefreshVisuals();
 
@@ -534,112 +896,48 @@ namespace FireSim
             IsBurning = false;
             IsSmouldering = false;
 
-            _flames.Stop(true, ParticleSystemStopBehavior.StopEmitting);
-            if (_embers != null) _embers.Stop(true, ParticleSystemStopBehavior.StopEmitting);
+            StopEmitting(_flames);
+            StopEmitting(_core);
+            StopEmitting(_sparks);
+            StopEmitting(_smoke);
+            StopEmitting(_embers);
             if (_glow != null) _glow.enabled = false;
             GetComponent<CapsuleCollider>().enabled = false;
+            FireLightField.Unregister(this);
 
             PlaySteamPuff();
 
+            // The mark outlives the patch: hand it to the fire root to fade on its own.
+            if (_scorch != null)
+            {
+                _scorch.Release(transform.parent, ScorchFadeSeconds);
+                _scorch = null;
+            }
+
             if (_manager != null) _manager.OnSpotOut(this);
-            // Leave the steam to finish, then remove the object entirely.
-            Destroy(gameObject, 2.5f);
+            // Leave the steam and the last of the smoke to finish, then remove the object entirely.
+            Destroy(gameObject, 4f);
         }
 
+        void OnDestroy()
+        {
+            FireLightField.Unregister(this);
+        }
+
+        static void StopEmitting(ParticleSystem ps)
+        {
+            if (ps != null) ps.Stop(true, ParticleSystemStopBehavior.StopEmitting);
+        }
+
+        /// <summary>A last, larger gout of steam as the fire is quenched.</summary>
         void PlaySteamPuff()
         {
-            var steamGo = new GameObject("Steam");
-            steamGo.transform.SetParent(transform, false);
-            var steam = steamGo.AddComponent<ParticleSystem>();
-            steam.Stop(true, ParticleSystemStopBehavior.StopEmittingAndClear);
-
-            var main = steam.main;
-            main.loop = false;
-            main.duration = 0.5f;
-            main.startLifetime = new ParticleSystem.MinMaxCurve(0.6f, 1.2f);
-            main.startSpeed = new ParticleSystem.MinMaxCurve(0.4f, 0.9f);
-            main.startSize = new ParticleSystem.MinMaxCurve(0.1f, 0.2f);
-            main.simulationSpace = ParticleSystemSimulationSpace.World;
-            main.startColor = new Color(0.85f, 0.85f, 0.85f, 0.5f);
-
-            var emission = steam.emission;
-            emission.rateOverTime = 0f;
-            emission.SetBursts(new[] { new ParticleSystem.Burst(0f, (short)25) });
-
-            var shape = steam.shape;
-            shape.shapeType = ParticleSystemShapeType.Hemisphere;
-            shape.radius = 0.1f;
-
-            var colorOverLifetime = steam.colorOverLifetime;
-            colorOverLifetime.enabled = true;
-            var grad = new Gradient();
-            grad.SetKeys(
-                new[] { new GradientColorKey(Color.white, 0f), new GradientColorKey(Color.gray, 1f) },
-                new[] { new GradientAlphaKey(0f, 0f), new GradientAlphaKey(0.5f, 0.2f), new GradientAlphaKey(0f, 1f) });
-            colorOverLifetime.color = new ParticleSystem.MinMaxGradient(grad);
-
-            steam.GetComponent<ParticleSystemRenderer>().material = FireSimVisuals.AlphaParticleMaterial;
-            steam.Play();
-        }
-    }
-
-    /// <summary>
-    /// Lazily-built, shared particle materials and a soft round particle texture, generated
-    /// at runtime so the simulation needs no imported art assets. Uses "Sprites/Default",
-    /// which renders correctly (unlit, vertex-coloured) under URP.
-    /// </summary>
-    public static class FireSimVisuals
-    {
-        static Texture2D _softDot;
-        static Material _additive;
-        static Material _alpha;
-
-        public static Texture2D SoftDot
-        {
-            get
-            {
-                if (_softDot != null) return _softDot;
-                const int size = 64;
-                _softDot = new Texture2D(size, size, TextureFormat.RGBA32, false) { name = "FireSim_SoftDot" };
-                Vector2 c = new Vector2(size * 0.5f, size * 0.5f);
-                for (int y = 0; y < size; y++)
-                for (int x = 0; x < size; x++)
-                {
-                    float d = Vector2.Distance(new Vector2(x, y), c) / (size * 0.5f);
-                    float a = Mathf.Clamp01(1f - d);
-                    a = a * a; // softer falloff
-                    _softDot.SetPixel(x, y, new Color(1f, 1f, 1f, a));
-                }
-                _softDot.Apply();
-                _softDot.wrapMode = TextureWrapMode.Clamp;
-                return _softDot;
-            }
-        }
-
-        public static Material AdditiveParticleMaterial
-        {
-            get
-            {
-                if (_additive != null) return _additive;
-                _additive = new Material(Shader.Find("Sprites/Default")) { name = "FireSim_FlameMat" };
-                _additive.mainTexture = SoftDot;
-                // Additive blending for a glowing flame look.
-                _additive.SetInt("_SrcBlend", (int)UnityEngine.Rendering.BlendMode.SrcAlpha);
-                _additive.SetInt("_DstBlend", (int)UnityEngine.Rendering.BlendMode.One);
-                _additive.renderQueue = (int)UnityEngine.Rendering.RenderQueue.Transparent;
-                return _additive;
-            }
-        }
-
-        public static Material AlphaParticleMaterial
-        {
-            get
-            {
-                if (_alpha != null) return _alpha;
-                _alpha = new Material(Shader.Find("Sprites/Default")) { name = "FireSim_FoamMat" };
-                _alpha.mainTexture = SoftDot;
-                return _alpha;
-            }
+            if (_steam == null) return;
+            var main = _steam.main;
+            main.startSize = new ParticleSystem.MinMaxCurve(_settings.Radius * 1.4f, _settings.Radius * 2.2f);
+            main.startSpeed = new ParticleSystem.MinMaxCurve(0.5f, 1.1f);
+            main.startLifetime = new ParticleSystem.MinMaxCurve(1.2f, 2.0f);
+            _steam.Emit(22);
         }
     }
 }
