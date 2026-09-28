@@ -3,6 +3,7 @@ using System.Threading;
 using System.Threading.Tasks;
 using FireSim;
 using HapticAI.Config;
+using HapticAI.Esp;
 using HapticAI.Net;
 using HapticAI.Profiles;
 using Meta.XR.MRUtilityKit;
@@ -35,6 +36,18 @@ namespace HapticAI.Scene
     /// </summary>
     public sealed class FireTrainingBootstrap : MonoBehaviour
     {
+        /// <summary>
+        /// How the ESP32 custom controller (bracket-mounted FSR402 + reed switch + DRV2605L, see
+        /// esp32-controller/README.md) participates, if at all. <see cref="ControllerDrivesGame"/> is
+        /// Mode A: its reed+force replace the Quest trigger locally via
+        /// <see cref="HapticAI.Esp.EspTriggerSource"/>, and everything downstream - fire sim, Gemini
+        /// haptics - is unchanged. <see cref="GeminiDrivesMotor"/> is Mode B: reed+force go straight
+        /// to the server via <see cref="HapticAI.Esp.EspGeminiLoop"/>, bypassing the fire sim, and
+        /// Gemini's selection drives the ESP32's haptic motor over BLE - useful for bringing up and
+        /// testing the physical controller loop on its own.
+        /// </summary>
+        public enum EspControllerMode { None, ControllerDrivesGame, GeminiDrivesMotor }
+
         [Header("Config")]
         [Tooltip("Pipeline configuration. If left empty a default (mock synth) config is created at runtime.")]
         public HapticAIConfig config;
@@ -55,6 +68,12 @@ namespace HapticAI.Scene
                  "Leave empty to load every room prefab under Resources/" + FallbackRoomResourcePath + ".")]
         public GameObject[] fallbackRooms;
 
+        [Header("ESP32 controller")]
+        [Tooltip("None: use the Quest controller as normal. ControllerDrivesGame / GeminiDrivesMotor " +
+                 "require the bracket-mounted ESP32 controller (esp32-controller/) and are Android-only " +
+                 "- both are silently ignored in the Editor.")]
+        public EspControllerMode espMode = EspControllerMode.None;
+
         const string FallbackRoomResourcePath = "HapticAI/Rooms";
 
         OVRCameraRig _rig;
@@ -64,6 +83,7 @@ namespace HapticAI.Scene
         TrainingSession _session;
         HapticStack _haptics;
         HapticPlayer _player;
+        EspBleClient _esp;
         CancellationTokenSource _cts;
         string _backendStatus = "unknown";
         bool _serverPaletteAdopted;
@@ -85,10 +105,13 @@ namespace HapticAI.Scene
 
                 BuildFoamSprayer();
                 _fireManager.AttachSprayer(_sprayer);
+                if (espMode == EspControllerMode.ControllerDrivesGame) BuildEspTriggerSource();
 
                 var secrets = await BuildHapticsAsync();
+                if (espMode == EspControllerMode.ControllerDrivesGame) MirrorHapticsToEsp();
                 BuildRelay();
                 BuildSession();
+                if (espMode == EspControllerMode.GeminiDrivesMotor) BuildEspGeminiLoop();
 
                 // Palette preparation must never strand the user on the "getting ready" screen:
                 // whatever happens, the session is told to move on.
@@ -120,6 +143,53 @@ namespace HapticAI.Scene
             _cts?.Cancel();
             _cts?.Dispose();
             _haptics.Client?.Dispose();
+            _esp?.Dispose();
+        }
+
+        // --- ESP32 controller -----------------------------------------------------------------
+
+        /// <summary>Mode A: the ESP32's reed+force stand in for the Quest trigger, nothing else changes.</summary>
+        void BuildEspTriggerSource()
+        {
+            _esp = new EspBleClient();
+            _esp.Connect();
+
+            var triggerGo = new GameObject("EspTriggerSource");
+            triggerGo.transform.SetParent(transform, false);
+            var trigger = triggerGo.AddComponent<EspTriggerSource>();
+            trigger.Bind(_esp);
+            _sprayer.TriggerSource = trigger;
+        }
+
+        /// <summary>
+        /// Mode A's motor: the ESP32's DRV2605L plays whatever the Quest controller is playing -
+        /// the AI profile loop and fire cues in the AI condition, the fixed rumble in the static
+        /// one - reduced to a 0-100% drive level. The session keeps exactly one of those two
+        /// sources active at a time, so they never fight over the motor.
+        /// </summary>
+        void MirrorHapticsToEsp()
+        {
+            _player.RightLevelChanged += level => _esp.SendHaptic(ToMotorPercent(level));
+            _sprayer.BuiltInVibration += amplitude => _esp.SendHaptic(ToMotorPercent(amplitude));
+        }
+
+        /// <summary>
+        /// Below a few percent a waveform is effectively silent, but the firmware floors any non-zero
+        /// command to the motor's spin threshold - so without a deadzone, faint tails would buzz.
+        /// </summary>
+        static int ToMotorPercent(float level) =>
+            level < 0.05f ? 0 : Mathf.Clamp(Mathf.RoundToInt(level * 100f), 1, 100);
+
+        /// <summary>Mode B: the ESP32's reed+force go to the server; its selection drives the motor.</summary>
+        void BuildEspGeminiLoop()
+        {
+            _esp = new EspBleClient();
+            _esp.Connect();
+
+            var loopGo = new GameObject("EspGeminiLoop");
+            loopGo.transform.SetParent(transform, false);
+            var loop = loopGo.AddComponent<EspGeminiLoop>();
+            loop.Initialise(_esp, _haptics.Client, _haptics.Library, _player);
         }
 
         // --- Haptics ------------------------------------------------------------------------

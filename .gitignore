@@ -109,6 +109,7 @@ InitTestScene*.unity*
 # HapticAI runtime secrets (Gemini API key, HaptiGen URL) — never commit
 /[Aa]ssets/StreamingAssets/hapticai.local.json
 /[Aa]ssets/StreamingAssets/hapticai.local.json.meta
+/server/.env
 
 # Generated haptics report (server/visualise.py)
 /haptic-report.html

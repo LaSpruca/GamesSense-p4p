@@ -56,10 +56,24 @@ namespace HapticAI.Scene
         /// </summary>
         public bool IsAvailable => OVRHaptics.Config.SampleSizeInBytes > 0;
 
+        /// <summary>Envelope window for <see cref="RightLevelChanged"/>: long enough to smooth out
+        /// the carrier, short enough to follow a cue's attack.</summary>
+        const float LevelWindowSeconds = 0.04f;
+
+        /// <summary>
+        /// The right hand's output level (0-1, mean amplitude over a short window) whenever it
+        /// changes - the same haptics the Quest controller plays, reduced to one number for a
+        /// single-actuator device such as the ESP32 controller's motor. Raised from
+        /// <see cref="Tick"/>, and with 0 from <see cref="StopAll"/>. Independent of whether a Touch
+        /// controller is available, so the external motor works even without one.
+        /// </summary>
+        public event System.Action<float> RightLevelChanged;
+
         readonly Output _left = new Output(() => OVRHaptics.LeftChannel);
         readonly Output _right = new Output(() => OVRHaptics.RightChannel);
         bool _warnedNoHaptics;
         bool _loggedAvailable;
+        float _rightLevel;
 
         /// <summary>
         /// Feeds the sustained channels. Must be called once per frame from a MonoBehaviour -
@@ -67,10 +81,18 @@ namespace HapticAI.Scene
         /// </summary>
         public void Tick()
         {
-            if (!CheckAvailable()) return;
             float now = Time.realtimeSinceStartup;
+            ReportRightLevel(_right.LevelAt(now));
+            if (!CheckAvailable()) return;
             _left.TopUp(now);
             _right.TopUp(now);
+        }
+
+        void ReportRightLevel(float level)
+        {
+            if (Mathf.Abs(level - _rightLevel) < 0.01f && (level > 0f) == (_rightLevel > 0f)) return;
+            _rightLevel = level;
+            RightLevelChanged?.Invoke(level);
         }
 
         /// <summary>
@@ -80,6 +102,7 @@ namespace HapticAI.Scene
         public void PlayCue(HapticClipData data, float gain = 1f, HapticHand hand = HapticHand.Right)
         {
             if (data == null || data.Amplitudes.Length == 0) return;
+            OutputFor(hand).StartCue(data.Amplitudes, gain, Time.realtimeSinceStartup);
             if (!CheckAvailable()) return;
 
             byte[] samples = data.Amplitudes;
@@ -106,8 +129,8 @@ namespace HapticAI.Scene
         public void SetSustained(HapticClipData data, float gain = 1f, HapticHand hand = HapticHand.Right)
         {
             if (data == null || data.Amplitudes.Length == 0) return;
-            if (!CheckAvailable()) return;
             OutputFor(hand).SetLoop(data.Amplitudes, gain);
+            CheckAvailable();
         }
 
         static byte Scale(byte amplitude, float gain)
@@ -131,6 +154,10 @@ namespace HapticAI.Scene
         {
             _left.ClearLoop();
             _right.ClearLoop();
+            _left.ClearCue();
+            _right.ClearCue();
+            // Tick may not run again (the relay stops ticking while muted), so report silence now.
+            ReportRightLevel(0f);
             if (!IsAvailable) return;
             OVRHaptics.LeftChannel.Clear();
             OVRHaptics.RightChannel.Clear();
@@ -195,6 +222,59 @@ namespace HapticAI.Scene
             {
                 _loop = null;
                 _read = 0;
+            }
+
+            // Cue bookkeeping for LevelAt only; playback itself goes through Channel.Preempt.
+            byte[] _cue;
+            float _cueGain;
+            float _cueStart;
+
+            public void StartCue(byte[] samples, float gain, float now)
+            {
+                _cue = samples;
+                _cueGain = gain < 0f ? 0f : gain;
+                _cueStart = now;
+            }
+
+            public void ClearCue() => _cue = null;
+
+            /// <summary>
+            /// Mean amplitude (0-1) of what this hand is playing at <paramref name="now"/>: the cue
+            /// while one is running (it preempts the loop, as on the controller), else the loop.
+            /// The loop position is taken from the clock rather than <c>_read</c>, which only moves
+            /// while a Touch controller is consuming slices.
+            /// </summary>
+            public float LevelAt(float now)
+            {
+                int rate = SampleRateHz;
+                int window = Mathf.Max(1, Mathf.RoundToInt(LevelWindowSeconds * rate));
+
+                if (_cue != null)
+                {
+                    int pos = Mathf.FloorToInt((now - _cueStart) * rate);
+                    if (pos < _cue.Length) return WindowMean(_cue, pos, window, wrap: false) * _cueGain;
+                    _cue = null;
+                }
+                if (_loop == null || _loop.Length == 0) return 0f;
+                int loopPos = (int)((long)(now * rate) % _loop.Length);
+                return WindowMean(_loop, loopPos, window, wrap: true) * _gain;
+            }
+
+            static float WindowMean(byte[] samples, int start, int count, bool wrap)
+            {
+                int sum = 0, n = 0;
+                for (int i = 0; i < count; i++)
+                {
+                    int idx = start + i;
+                    if (idx >= samples.Length)
+                    {
+                        if (!wrap) break;
+                        idx %= samples.Length;
+                    }
+                    sum += samples[idx];
+                    n++;
+                }
+                return n == 0 ? 0f : Mathf.Min(1f, sum / (255f * n));
             }
 
             public void TopUp(float now)

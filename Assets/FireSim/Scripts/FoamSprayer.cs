@@ -36,6 +36,13 @@ namespace FireSim
         public bool useBuiltInHaptics = true;
 
         /// <summary>
+        /// Optional replacement for the Quest controller's analog trigger, e.g. the ESP32 custom
+        /// controller's force sensor + reed switch (see HapticAI.Esp.EspTriggerSource). When set,
+        /// this is read instead of OVRInput every frame; when null, behaviour is unchanged.
+        /// </summary>
+        public IExtinguisherTriggerSource TriggerSource { get; set; }
+
+        /// <summary>
         /// Whether the trigger does anything. The session disarms the extinguisher outside a run so
         /// the user can't hose the room while the briefing is still up.
         /// </summary>
@@ -58,6 +65,12 @@ namespace FireSim
         /// haptics path subscribes to this to track spray force; static mode ignores it.
         /// </summary>
         public event System.Action<float> Spraying;
+        /// <summary>
+        /// The built-in rumble's amplitude (0-1) each time it is set, including 0 when it stops, so
+        /// an external actuator can mirror the static condition. Silent while
+        /// <see cref="useBuiltInHaptics"/> is off.
+        /// </summary>
+        public event System.Action<float> BuiltInVibration;
 
         static readonly Color FoamWhite = new Color(0.98f, 0.98f, 0.95f, 0.96f);
         static readonly Color FoamCream = new Color(0.93f, 0.94f, 0.96f, 0.92f);
@@ -256,7 +269,9 @@ namespace FireSim
 
         void Update()
         {
-            float trigger = OVRInput.Get(OVRInput.Axis1D.PrimaryIndexTrigger, OVRInput.Controller.RTouch);
+            float trigger = TriggerSource != null && TriggerSource.TryGetTrigger(out float external)
+                ? external
+                : OVRInput.Get(OVRInput.Axis1D.PrimaryIndexTrigger, OVRInput.Controller.RTouch);
             bool wantSpray = Armed && trigger >= triggerThreshold;
 
             if (wantSpray)
@@ -268,6 +283,7 @@ namespace FireSim
                     // Vibration intensity tracks how hard the trigger is pulled.
                     float amplitude = Mathf.Lerp(0.15f, hapticMaxAmplitude, Mathf.InverseLerp(triggerThreshold, 1f, trigger));
                     OVRInput.SetControllerVibration(hapticFrequency, amplitude, OVRInput.Controller.RTouch);
+                    BuiltInVibration?.Invoke(amplitude);
                 }
                 if (!_spraying)
                 {
@@ -287,7 +303,10 @@ namespace FireSim
             _emission.rateOverTime = 0f;
             if (_mist != null) _mistEmission.rateOverTime = 0f;
             if (useBuiltInHaptics)
+            {
                 OVRInput.SetControllerVibration(0f, 0f, OVRInput.Controller.RTouch);
+                BuiltInVibration?.Invoke(0f);
+            }
             _spraying = false;
             SprayStopped?.Invoke();
         }

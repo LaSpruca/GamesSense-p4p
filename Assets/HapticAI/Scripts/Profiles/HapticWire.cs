@@ -62,6 +62,8 @@ namespace HapticAI.Profiles
             public string type;
             public string profile;
             public float gain;
+            /// <summary>Gain rescaled to 0-100, for a physical haptic motor (e.g. the ESP32's DRV2605L).</summary>
+            public int pwm;
             public string source;
             public string reason;
             public string state_key;

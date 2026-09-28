@@ -23,7 +23,9 @@ Server -> client
     welcome       {"gemini": bool, "transport": str, "model": bool}
     profiles      {"set_id","scene_key","source","notes","profiles":[...]}
     clip          (binary, above)
-    select        {"profile","gain","source","reason","state_key"}
+    select        {"profile","gain","pwm","source","reason","state_key"}
+                  pwm is gain rescaled to 0-100, for a headset driving a physical haptic motor
+                  (e.g. the ESP32 controller's DRV2605L) instead of/alongside the Quest actuator.
     error         {"message": str}
 """
 

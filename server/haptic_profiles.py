@@ -175,9 +175,22 @@ class Selection:
     reason: str = ""
     state_key: str = ""
 
+    @property
+    def pwm(self) -> int:
+        """Gain (0-1) rescaled to the 0-100% duty cycle the ESP32 haptic driver expects.
+
+        Gain and PWM are the same "how strong" decision; a physical motor just wants it as a
+        percentage instead of a 0-1 float. Silent (profile == "") always means 0%, regardless
+        of a stale gain value.
+        """
+        if not self.profile:
+            return 0
+        return max(0, min(100, round(self.gain * 100)))
+
     def to_wire(self) -> Dict[str, Any]:
         return {"type": "select", "profile": self.profile, "gain": round(self.gain, 3),
-                "source": self.source, "reason": self.reason, "state_key": self.state_key}
+                "pwm": self.pwm, "source": self.source, "reason": self.reason,
+                "state_key": self.state_key}
 
 
 # --- Offline templates ----------------------------------------------------------------------------
