@@ -24,7 +24,7 @@ namespace HapticAI.Scene
     /// </summary>
     public sealed class TrainingSession : MonoBehaviour
     {
-        public enum Phase { Loading, Briefing, Running, StageComplete, AllComplete, Failed, Paused }
+        public enum Phase { Loading, HapticsGuide, Briefing, Running, StageComplete, AllComplete, Failed, Paused }
 
         /// <summary>Rows of the pause menu, in the order they are drawn.</summary>
         enum PauseRow { Resume, RestartStage, StartOver, Setup }
@@ -49,6 +49,7 @@ namespace HapticAI.Scene
         float _runStartedAt;
         float _runSeconds;
         int _stageIndex = 1;
+        bool _hapticsGuideShown;
         Phase _pausedFrom;
         int _pauseSelected;
         readonly AxisRepeat _pauseVertical = new AxisRepeat();
@@ -132,6 +133,11 @@ namespace HapticAI.Scene
                 case Phase.Loading:
                     if (Time.time - _loadStartedAt > roomTimeoutSeconds && !_fire.RoomReady) EnterRoomFailure();
                     else EnterLoading();   // cheap: only redraws when a progress line actually changes
+                    break;
+
+                case Phase.HapticsGuide:
+                    if (BackPressed()) ReturnToSetup();
+                    else if (ConfirmPressed()) { _hapticsGuideShown = true; EnterBriefing(); }
                     break;
 
                 case Phase.Briefing:
@@ -334,6 +340,15 @@ namespace HapticAI.Scene
 
         void EnterBriefing()
         {
+            // The dynamic haptics are a vocabulary the trainee has to know before it can help them,
+            // so it is explained once, ahead of the first briefing in that condition - including
+            // when the condition is switched to it partway through.
+            if (Mode == HapticsMode.Ai && !_hapticsGuideShown)
+            {
+                EnterHapticsGuide();
+                return;
+            }
+
             var stage = Stage;
             var sb = new StringBuilder();
             sb.Append(stage.Objective).Append("\n\n");
@@ -357,6 +372,33 @@ namespace HapticAI.Scene
 
             _panel.Show($"Stage {stage.Index} of {TrainingStages.Count} - {stage.Name} ({ParticipantId})", body,
                 Footer("A  start"));
+        }
+
+        /// <summary>
+        /// What each dynamic-haptics pattern means. Must stay in step with what the AI condition
+        /// actually plays: <see cref="HapticAI.Profiles.HapticProfileSelector.TechniquePulseHz"/> for
+        /// the spray, and the taps in <see cref="FireHapticRelay"/>.
+        /// </summary>
+        void EnterHapticsGuide()
+        {
+            if (Current == Phase.HapticsGuide) return;
+            Current = Phase.HapticsGuide;
+            _sprayer.Armed = false;
+            _lastBody = null;
+
+            var rows = new List<MenuRow>
+            {
+                new MenuRow("Pin pulled", "one short tap", false),
+                new MenuRow("Spraying the base of the fire", "steady, strong buzz", false),
+                new MenuRow("Slightly off target", "slow pulsing", false),
+                new MenuRow("Way off target", "fast pulsing", false),
+                new MenuRow("Fire knocked down", "double tap", false),
+            };
+            _panel.ShowMenu($"What You'll Feel - the extinguisher tells you how you're doing ({ParticipantId})",
+                rows,
+                "A steady buzz means keep going. Pulsing means re-aim at the base of the flames - " +
+                "the faster it pulses, the further off you are.",
+                "A  got it     Y  setup");
         }
 
         void StartRun()

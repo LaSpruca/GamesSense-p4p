@@ -84,47 +84,46 @@ namespace HapticAI.Profiles
         }
 
         /// <summary>
-        /// How strongly the spray loop plays for a situation: quiet when the technique is right,
-        /// heavy when it is wrong, so the rumble itself says "you're off". It is the only feedback a
-        /// single-actuator device (the ESP32 motor) can carry, since it cannot render texture.
-        /// Trigger depth deliberately plays no part - a hard squeeze aimed well must stay quiet.
+        /// How strongly the spray loop plays: one strong level for every situation. Whether the
+        /// technique is right is carried by rhythm (<see cref="TechniquePulseHz"/>) - steady on the
+        /// base, pulsing when off target - which is the only distinction a single-actuator device
+        /// (the ESP32 motor) can carry besides strength. Trigger depth plays no part.
         /// Must match <c>technique_gain</c> in server/haptic_profiles.py.
         /// </summary>
-        public static float TechniqueGain(string contact, in SprayReading r) =>
-            IsGoodContact(contact) ? GoodBuzzGain : 1f;
+        public static float TechniqueGain(string contact, in SprayReading r) => SprayGain;
 
-        /// <summary>The steady medium buzz for good technique.</summary>
-        public const float GoodBuzzGain = 0.5f;
-
-        static bool IsGoodContact(string contact) => contact == "sweep" || contact == "base" || contact == "soak";
+        /// <summary>The steady, strong spray buzz, and the level the off-target pulses hit.</summary>
+        public const float SprayGain = 0.9f;
 
         /// <summary>
-        /// The rhythm half of the same message: good technique is a continuous medium buzz, poor
-        /// technique is a "thump ... thump" - full-strength hits (<see cref="ThumpSeconds"/> each)
-        /// separated by complete silence, coming faster the further off it is. Decided on the
-        /// headset only - Gemini never changes rhythm.
+        /// Steady while the foam is on the base (sweeping or soaking a knocked-down patch counts);
+        /// pulsing otherwise - slowly when slightly off (on the flames above the base), quickly when
+        /// way off (missing the fire). Decided on the headset only - Gemini never changes rhythm.
         /// </summary>
         public static float TechniquePulseHz(string contact, in SprayReading r)
         {
-            if (IsGoodContact(contact)) return 0f;
-            if (contact == "top") return 1.5f + 0.75f * Clamp01(1f - Clamp01(r.HitQuality) / BaseQuality);
-            return 2.5f;   // dry: missing the fire entirely
+            switch (contact)
+            {
+                case "sweep":
+                case "base":
+                case "soak": return 0f;
+                case "top": return SlowPulseHz;
+                default: return FastPulseHz;
+            }
         }
 
-        /// <summary>
-        /// How long each thump is on. Long enough for an ERM motor to spin up (~30-50 ms) and land a
-        /// solid hit, short enough to read as a knock rather than a buzz.
-        /// </summary>
-        public const float ThumpSeconds = 0.1f;
+        public const float SlowPulseHz = 2f;
+        public const float FastPulseHz = 5f;
 
         /// <summary>
-        /// The range Gemini may choose within for a situation, so its refinements can never invert
-        /// the good-quiet / bad-heavy rule. Must match <c>GAIN_BANDS</c> in server/haptic_profiles.py.
+        /// The range Gemini may choose within: a little leeway around <see cref="SprayGain"/>,
+        /// never low enough to blur the steady buzz into something faint.
+        /// Must match <c>GAIN_BANDS</c> in server/haptic_profiles.py.
         /// </summary>
         public static void GainBand(string contact, out float min, out float max)
         {
-            if (IsGoodContact(contact)) { min = 0.40f; max = 0.60f; }
-            else { min = 1.00f; max = 1.00f; }
+            min = 0.80f;
+            max = 1.00f;
         }
 
         /// <summary>The situation part of a coarse key ("base|t1" -> "base"), or the key itself.</summary>
@@ -134,8 +133,6 @@ namespace HapticAI.Profiles
             int bar = stateKey.IndexOf('|');
             return bar < 0 ? stateKey : stateKey.Substring(0, bar);
         }
-
-        static float Clamp01(float v) => Math.Max(0f, Math.Min(1f, v));
 
         public static ProfileSelection Rules(in SprayReading r)
         {

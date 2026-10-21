@@ -139,40 +139,35 @@ namespace HapticAI.Tests
             Assert.AreEqual(HapticRoles.SprayTop, HapticProfileSelector.Rules(sweepingButHigh).Role);
         }
 
+        static SprayReading SprayAt(float hitRate, float quality, bool sweeping = false, bool soaking = false) =>
+            new SprayReading
+            {
+                Spraying = true, Trigger = 0.7f, HitRate = hitRate, HitQuality = quality,
+                Sweeping = sweeping, Soaking = soaking,
+            };
+
         [Test]
-        public void Selector_GainIsQuietForGoodTechniqueAndHeavyForPoor()
+        public void Selector_SprayIsOneStrongLevelEverywhere()
         {
-            SprayReading At(float hitRate, float quality, bool sweeping = false) => new SprayReading
-                { Spraying = true, Trigger = 0.7f, HitRate = hitRate, HitQuality = quality, Sweeping = sweeping };
-
-            float sweep = HapticProfileSelector.Rules(At(100f, 1f, sweeping: true)).Gain;
-            float baseHit = HapticProfileSelector.Rules(At(100f, 0.7f)).Gain;
-            float top = HapticProfileSelector.Rules(At(100f, 0.3f)).Gain;
-            float dry = HapticProfileSelector.Rules(At(0f, 0f)).Gain;
-
-            Assert.That(sweep, Is.EqualTo(HapticProfileSelector.GoodBuzzGain).Within(0.001f));
-            Assert.That(baseHit, Is.EqualTo(HapticProfileSelector.GoodBuzzGain).Within(0.001f));
-            Assert.That(top, Is.EqualTo(1f).Within(0.001f));
-            Assert.That(dry, Is.EqualTo(1f).Within(0.001f));
-            Assert.AreEqual("rules", HapticProfileSelector.Rules(At(0f, 0f)).Source);
+            foreach (var r in new[]
+            {
+                SprayAt(100f, 1f, sweeping: true), SprayAt(100f, 0.7f), SprayAt(100f, 0.3f),
+                SprayAt(0f, 0f, soaking: true), SprayAt(0f, 0f),
+            })
+                Assert.That(HapticProfileSelector.Rules(r).Gain, Is.EqualTo(HapticProfileSelector.SprayGain).Within(0.001f));
+            Assert.AreEqual("rules", HapticProfileSelector.Rules(SprayAt(0f, 0f)).Source);
         }
 
         [Test]
-        public void Selector_GoodTechniqueIsContinuousAndPoorTechniqueBeepsFaster()
+        public void Selector_SteadyOnTheBaseSlowPulseSlightlyOffFastPulseWayOff()
         {
-            SprayReading At(float hitRate, float quality, bool sweeping = false, bool soaking = false) => new SprayReading
-                { Spraying = true, Trigger = 0.7f, HitRate = hitRate, HitQuality = quality, Sweeping = sweeping, Soaking = soaking };
+            Assert.AreEqual(0f, HapticProfileSelector.Rules(SprayAt(100f, 1f, sweeping: true)).PulseHz);
+            Assert.AreEqual(0f, HapticProfileSelector.Rules(SprayAt(100f, 0.8f)).PulseHz);
+            Assert.AreEqual(0f, HapticProfileSelector.Rules(SprayAt(0f, 0f, soaking: true)).PulseHz);
 
-            Assert.AreEqual(0f, HapticProfileSelector.Rules(At(100f, 1f, sweeping: true)).PulseHz);
-            Assert.AreEqual(0f, HapticProfileSelector.Rules(At(100f, 0.8f)).PulseHz);
-            Assert.AreEqual(0f, HapticProfileSelector.Rules(At(0f, 0f, soaking: true)).PulseHz);
-
-            float nearBase = HapticProfileSelector.Rules(At(100f, 0.5f)).PulseHz;
-            float tips = HapticProfileSelector.Rules(At(100f, 0f)).PulseHz;
-            float dry = HapticProfileSelector.Rules(At(0f, 0f)).PulseHz;
-            Assert.Greater(nearBase, 0f);
-            Assert.Less(nearBase, tips);
-            Assert.Less(tips, dry);
+            Assert.AreEqual(HapticProfileSelector.SlowPulseHz, HapticProfileSelector.Rules(SprayAt(100f, 0.3f)).PulseHz);
+            Assert.AreEqual(HapticProfileSelector.FastPulseHz, HapticProfileSelector.Rules(SprayAt(0f, 0f)).PulseHz);
+            Assert.Less(HapticProfileSelector.SlowPulseHz, HapticProfileSelector.FastPulseHz);
         }
 
         [Test]
@@ -180,7 +175,7 @@ namespace HapticAI.Tests
         {
             var light = HapticProfileSelector.Rules(new SprayReading { Spraying = true, Trigger = 0.2f, HitRate = 100f, HitQuality = 1f });
             var hard = HapticProfileSelector.Rules(new SprayReading { Spraying = true, Trigger = 1f, HitRate = 100f, HitQuality = 1f });
-            Assert.That(hard.Gain, Is.EqualTo(light.Gain).Within(0.001f), "a hard squeeze aimed well stays quiet");
+            Assert.That(hard.Gain, Is.EqualTo(light.Gain).Within(0.001f));
         }
 
         [Test]

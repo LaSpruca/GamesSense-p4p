@@ -10,8 +10,8 @@ namespace HapticAI.Scene
     /// <summary>
     /// Bridges the fire simulation to the profile-based haptics. Two jobs:
     ///
-    ///   * <b>Cues.</b> Fire events (ignite / spread / extinguish / re-ignite / stage complete)
-    ///     each map to a one-shot role in the palette and play in full.
+    ///   * <b>Cues.</b> A fire knocked down is a double tap and the pin pulled a single tap; the
+    ///     other fire events are reported to the server but not felt.
     ///
     ///   * <b>The spray.</b> Every frame the trigger is held, the fire sim's telemetry (is the foam
     ///     landing, where on the flames, is the nozzle sweeping, is it soaking embers) is turned into
@@ -26,9 +26,6 @@ namespace HapticAI.Scene
     /// </summary>
     public sealed class FireHapticRelay : MonoBehaviour
     {
-        /// <summary>Seconds between ember pulses while a smouldering patch is left un-soaked.</summary>
-        const float SmoulderWarningInterval = 2.5f;
-
         // Individual labels probed to name the surface a fire sits on (order = priority).
         static readonly MRUKAnchor.SceneLabels[] CandidateLabels =
         {
@@ -55,7 +52,6 @@ namespace HapticAI.Scene
         HapticClipData _loopClip;
         float _nextStateSendAt;
         bool _sentIdle = true;
-        float _nextSmoulderWarningAt;
 
         /// <summary>Human-readable description of the last clip played, for the debug readout.</summary>
         public string LastClipDescription { get; private set; } = "(nothing played yet)";
@@ -130,7 +126,6 @@ namespace HapticAI.Scene
             var reading = ToReading(_fire.Telemetry);
             DriveLoop(reading);
             StreamState(reading);
-            WarnAboutSmouldering(reading);
         }
 
         static SprayReading ToReading(in SprayTelemetry t) => new SprayReading
@@ -162,9 +157,9 @@ namespace HapticAI.Scene
                 return;
             }
 
-            // The palette's per-role gain is not applied here: the spray loop's strength IS the
-            // technique signal (a fixed medium buzz vs full-scale thumps), so it must not drift
-            // with whatever loudness the planner gave each role.
+            // The palette's per-role gain is not applied here: the spray loop is a fixed strong
+            // level whose rhythm carries the technique signal, so it must not drift with whatever
+            // loudness the planner gave each role.
             var clip = _library.ClipFor(chosen.Role, out _, out bool isFallback);
             float gain = chosen.Gain;
             // Rhythm always comes from the live reading, even under a Gemini override (which only
@@ -220,14 +215,6 @@ namespace HapticAI.Scene
             }
         }
 
-        void WarnAboutSmouldering(in SprayReading reading)
-        {
-            if (reading.FiresSmouldering == 0 || reading.Soaking || _muted) return;
-            if (Time.unscaledTime < _nextSmoulderWarningAt) return;
-            _nextSmoulderWarningAt = Time.unscaledTime + SmoulderWarningInterval;
-            PlayRoleCue(HapticRoles.SmoulderWarning, null);
-        }
-
         // --- Server selections ------------------------------------------------------------
 
         void OnServerSelection(HapticWire.Select select)
@@ -265,28 +252,55 @@ namespace HapticAI.Scene
 
         // --- Discrete fire cues -------------------------------------------------------------
 
-        void OnIgnited(FireSpot spot) => PlayRoleCue(HapticRoles.Ignite, spot);
-        void OnSpread(FireSpot spot) => PlayRoleCue(HapticRoles.Spread, spot);
-        void OnExtinguished(FireSpot spot) => PlayRoleCue(HapticRoles.Extinguish, spot);
-        void OnReignited(FireSpot spot) => PlayRoleCue(HapticRoles.Reignite, spot);
+        // Only two events are felt - a fire knocked down (double tap) and the pin pulled (single
+        // tap, see PlayPinPulled). The rest are still reported so Gemini keeps its context, but
+        // stay silent: a small fixed vocabulary is what makes each feel unambiguous.
+        void OnIgnited(FireSpot spot) => TellServer(HapticRoles.Ignite, spot);
+        void OnSpread(FireSpot spot) => TellServer(HapticRoles.Spread, spot);
+        void OnReignited(FireSpot spot) => TellServer(HapticRoles.Reignite, spot);
+
+        void OnExtinguished(FireSpot spot)
+        {
+            TellServer(HapticRoles.Extinguish, spot);
+            PlayTaps(2, "knocked down");
+        }
 
         void OnAllExtinguished()
         {
-            // The spray loop must stop before the completion cue, or the loop would immediately
-            // preempt it on the next Tick.
             ClearLoop();
-            PlayRoleCue(HapticRoles.StageComplete, null);
+            TellServer(HapticRoles.StageComplete, null);
         }
 
         void OnSprayStopped() => ClearLoop();
 
-        void PlayRoleCue(string role, FireSpot spot)
+        /// <summary>One short tap when the extinguisher's pin is pulled (the ESP32's reed switch).</summary>
+        public void PlayPinPulled() => PlayTaps(1, "pin pulled");
+
+        void PlayTaps(int taps, string detail)
         {
-            TellServer(role, spot);
-            if (_muted) return;
-            var clip = _library.ClipFor(role, out float profileGain, out bool isFallback);
-            _player.PlayCue(clip, profileGain);
-            Record(clip, "cue", isFallback, role);
+            if (_muted || _player == null) return;
+            // Built per play rather than cached: the controller's sample rate is only known once
+            // the runtime reports a controller, and the clip is a few dozen bytes.
+            var clip = BuildTaps(taps);
+            _player.PlayCue(clip);
+            Record(clip, "cue", false, detail);
+        }
+
+        // Full-strength taps, each long enough for an ERM motor to spin up (~30-50 ms) and land,
+        // with a gap long enough to fall silent between the two of a double tap.
+        const float TapSeconds = 0.07f;
+        const float TapGapSeconds = 0.1f;
+
+        static HapticClipData BuildTaps(int taps)
+        {
+            int rate = HapticPlayer.SampleRateHz;
+            int on = Mathf.RoundToInt(TapSeconds * rate);
+            int gap = Mathf.RoundToInt(TapGapSeconds * rate);
+            var samples = new byte[taps * on + (taps - 1) * gap];
+            for (int t = 0; t < taps; t++)
+                for (int i = 0; i < on; i++)
+                    samples[t * (on + gap) + i] = 255;
+            return new HapticClipData(taps == 1 ? "tap" : "double_tap", samples, rate);
         }
 
         void TellServer(string role, FireSpot spot)

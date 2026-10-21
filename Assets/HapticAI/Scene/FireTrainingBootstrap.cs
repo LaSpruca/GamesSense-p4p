@@ -110,6 +110,7 @@ namespace HapticAI.Scene
                 var secrets = await BuildHapticsAsync();
                 if (espMode == EspControllerMode.ControllerDrivesGame) MirrorHapticsToEsp();
                 BuildRelay();
+                if (espMode == EspControllerMode.ControllerDrivesGame) TapOnPinPulled();
                 BuildSession();
                 if (espMode == EspControllerMode.GeminiDrivesMotor) BuildEspGeminiLoop();
 
@@ -171,6 +172,23 @@ namespace HapticAI.Scene
         {
             _player.RightLevelChanged += level => _esp.SendHaptic(ToMotorPercent(level));
             _sprayer.BuiltInVibration += amplitude => _esp.SendHaptic(ToMotorPercent(amplitude));
+        }
+
+        /// <summary>
+        /// The reed switch is the extinguisher's pin: its magnet comes away with the pin, and the
+        /// handle cannot be squeezed until it has. The moment it reads "pulled" (the state
+        /// <see cref="EspTriggerSource"/> treats as able to spray) is a single tap. The first reading
+        /// after connecting only sets the baseline, so a pin already out does not tap on connect.
+        /// </summary>
+        void TapOnPinPulled()
+        {
+            bool? pinOut = null;
+            _esp.SensorUpdated += (reed, _) =>
+            {
+                if (pinOut == false && reed) _relay.PlayPinPulled();
+                pinOut = reed;
+            };
+            _esp.Disconnected += _ => pinOut = null;
         }
 
         /// <summary>

@@ -246,22 +246,20 @@ def coarse_state_key(state: Dict[str, Any]) -> str:
     return f"{contact}|{tb}"
 
 
-GOOD_CONTACTS = ("sweep", "base", "soak")
-GOOD_BUZZ_GAIN = 0.5
+SPRAY_GAIN = 0.9
 
-# Range Gemini may pick within per situation: a little leeway on the good-technique buzz, none on
-# poor technique, which the headset plays as full-scale thumps. Must match
+# Range Gemini may pick within: a little leeway around SPRAY_GAIN, never faint. Must match
 # HapticProfileSelector.GainBand.
-GAIN_BANDS = {**{c: (0.40, 0.60) for c in GOOD_CONTACTS}, "top": (1.0, 1.0), "dry": (1.0, 1.0)}
+GAIN_BANDS = {c: (0.80, 1.00) for c in ("sweep", "base", "soak", "top", "dry")}
 
 
 def technique_gain(contact: str, state: Dict[str, Any]) -> float:
     """
-    Spray loop strength: a steady medium buzz for good technique, full strength for poor (the
-    headset plays that as thumps separated by silence). Trigger depth plays no part.
-    Must match HapticProfileSelector.TechniqueGain.
+    Spray loop strength: one strong level everywhere. The headset carries technique in rhythm -
+    steady on the base, slow pulsing slightly off target, fast pulsing way off. Trigger depth plays
+    no part. Must match HapticProfileSelector.TechniqueGain.
     """
-    return GOOD_BUZZ_GAIN if contact in GOOD_CONTACTS else 1.0
+    return SPRAY_GAIN
 
 
 def rule_select(state: Dict[str, Any]) -> Selection:
@@ -301,9 +299,9 @@ DIRECTOR_SYSTEM = (
     "reinforces correct technique: spray_base when foam lands on the base (hit_quality high), "
     "spray_sweep when it is also sweeping, spray_top when foam lands on the tips (hit_quality low), "
     "spray_dry when it is missing (hit_rate near 0), spray_soak when soaking a smouldering patch. "
-    "Gain is NOT trigger depth: good technique (foam on the base, sweeping or soaking) is a steady "
-    "medium buzz - gain 0.4-0.6. Poor technique (flame tips, or missing the fire) is always gain 1.0; "
-    "the headset turns it into full-strength thumps.\n"
+    "Gain is NOT trigger depth: keep it strong, 0.8-1.0, in every situation. The headset signals "
+    "technique by rhythm itself - steady on the base, slow pulsing on the flame tips, fast pulsing "
+    "when missing the fire.\n"
     + READING_FIELDS
 )
 
